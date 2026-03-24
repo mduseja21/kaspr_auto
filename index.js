@@ -12,6 +12,9 @@ const RESOLVED_EXTENSION = resolveKasprExtensionPath();
 
 // ─── CONFIG ───────────────────────────────────────────────────────────
 const CONFIG = {
+  kasprEmail: process.env.KASPR_EMAIL || "ajakki@purdue.edu",
+  kasprPassword: process.env.KASPR_PASSWORD || "Ashwin@387",
+
   extensionPath: RESOLVED_EXTENSION.path,
   extensionSource: RESOLVED_EXTENSION.source,
   extensionCandidates: RESOLVED_EXTENSION.candidates,
@@ -24,9 +27,9 @@ const CONFIG = {
   urlColumn: process.env.URL_COLUMN || "linkedin_url",
   outputCsv: process.env.OUTPUT_CSV || "results.csv",
 
-  // Delay between profile visits (ms) — randomized between min and max
-  minDelay: 5_000,
-  maxDelay: 15_000,
+  // Delay between API calls (ms) — randomized between min and max
+  minDelay: 1_000,
+  maxDelay: 3_000,
 
   // Max profiles to process per run
   maxProfiles: parseInt(process.env.MAX_PROFILES || "9999", 10),
@@ -250,38 +253,33 @@ function saveResult(results) {
 // ─── KASPR WIDGET SCRAPING ───────────────────────────────────────────
 
 async function findKasprWidget(page) {
-  const selectors = [".kaspr-wk", ".kaspr-popup", ".kspr-popup-wrapper", '[class*="kaspr"]', '[class*="kspr"]'];
-
-  // Race all selectors in parallel — first one to match wins (single 15s timeout total, not per selector)
+  // The Kaspr widget uses #KasprPlugin as its main container
   try {
-    const result = await Promise.race([
-      ...selectors.map(sel =>
-        page.waitForSelector(sel, { timeout: CONFIG.kaspWidgetTimeout }).then(() => sel)
-      ),
-      // Also check for text-based detection every 2s
-      (async () => {
-        const start = Date.now();
-        while (Date.now() - start < CONFIG.kaspWidgetTimeout) {
-          const found = await page.evaluate(() => {
-            const all = document.querySelectorAll("*");
-            for (const el of all) {
-              const text = el.textContent.trim().toLowerCase();
-              if (text.includes("reveal contact details") || text.includes("b2b email")) {
-                return true;
-              }
-            }
-            return false;
-          });
-          if (found) return "text-based";
-          await sleep(2000);
-        }
-        throw new Error("text-based timeout");
-      })(),
-    ]);
-    return result;
+    await page.waitForSelector("#KasprPlugin", { timeout: CONFIG.kaspWidgetTimeout });
+    return "#KasprPlugin";
   } catch {}
-
   return null;
+}
+
+async function waitForWidgetReady(page) {
+  try {
+    await page.waitForFunction(
+      () => {
+        const el = document.querySelector("#KasprPlugin");
+        if (!el) return true; // no widget, bail
+        const text = el.innerText;
+        return text.includes("Contact Information") ||
+               text.includes("Sorry") ||
+               text.includes("Export") ||
+               text.trim().length > 50;
+      },
+      { timeout: 15000 }
+    );
+    return true;
+  } catch {
+    console.log("  (Widget did not load after 15s)");
+    return false;
+  }
 }
 
 async function extractKasprData(page) {
@@ -293,20 +291,41 @@ async function extractKasprData(page) {
     console.log("  Kaspr widget not found on this page.");
     return { emails, phones };
   }
-  console.log(`  Kaspr widget found (${widget})`);
+  console.log("  Kaspr widget found.");
 
-  // Wait for widget to fully render
-  await sleep(3000);
+  // Wait for "Searching contact information..." to finish
+  console.log("  Waiting for widget to load...");
+  await waitForWidgetReady(page);
 
-  // Step 1: Click "Reveal contact details" button using real mouse click
+  // Dump widget state for debugging
+  const widgetState = await page.evaluate(() => {
+    const el = document.querySelector("#KasprPlugin");
+    if (!el) return "no widget";
+    return el.innerText.substring(0, 300);
+  });
+  console.log(`  Widget text: ${widgetState.replace(/\n/g, " | ").substring(0, 200)}`);
+
+  // Step 1: Click "Reveal contact details" button inside #KasprPlugin
+  // The button has class "btn sm step1" and is inside div.btn-in.searching-contact-info
   try {
     const revealPos = await page.evaluate(() => {
-      const all = document.querySelectorAll("button, a, div, span, [role='button']");
+      const plugin = document.querySelector("#KasprPlugin");
+      if (!plugin) return null;
+      // Try the specific class first
+      const btn = plugin.querySelector(".btn-in button.step1") || plugin.querySelector("button.step1");
+      if (btn) {
+        const rect = btn.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) {
+          return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, text: btn.textContent.trim() };
+        }
+      }
+      // Fallback: find by text
+      const all = plugin.querySelectorAll("button");
       for (const el of all) {
         if (el.textContent.trim().toLowerCase().includes("reveal contact")) {
           const rect = el.getBoundingClientRect();
           if (rect.width > 0 && rect.height > 0) {
-            return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+            return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, text: el.textContent.trim() };
           }
         }
       }
@@ -314,80 +333,52 @@ async function extractKasprData(page) {
     });
     if (revealPos) {
       await page.mouse.click(revealPos.x, revealPos.y);
-      console.log("  Clicked 'Reveal contact details'");
-      await sleep(5000);
+      console.log(`  Clicked '${revealPos.text}'`);
+      // Wait for masked emails (***@) to disappear or Show buttons to go away (max 10s)
+      const revealStart = Date.now();
+      while (Date.now() - revealStart < 10000) {
+        const stillMasked = await page.evaluate(() => {
+          const plugin = document.querySelector("#KasprPlugin");
+          if (!plugin) return false;
+          return plugin.innerText.includes("***@") || plugin.querySelector("button.show-btn") !== null;
+        });
+        if (!stillMasked) break;
+        await sleep(500);
+      }
+    } else {
+      console.log("  No 'Reveal' button found (may already be revealed).");
     }
   } catch (err) {
     console.log(`  Error clicking reveal: ${err.message}`);
   }
 
-  // Step 2: Click the "Show" button near "B2B email" only (save credits) using real mouse click
+  // Step 2: If still masked, click Show button as fallback
   try {
-    const showPos = await page.evaluate(() => {
-      const all = [...document.querySelectorAll("*")];
-
-      // Find the element that says "B2B email"
-      let b2bSection = null;
-      for (const el of all) {
-        if (el.children.length <= 2 && el.textContent.trim().toLowerCase().includes("b2b email")) {
-          b2bSection = el;
-          break;
-        }
-      }
-
-      if (b2bSection) {
-        // Walk up to find a container, then look for a "Show" button
-        let container = b2bSection;
-        for (let depth = 0; depth < 8; depth++) {
-          const buttons = container.querySelectorAll("button, a, span, div, [role='button']");
-          for (const btn of buttons) {
-            const txt = btn.textContent.trim();
-            if (txt.toLowerCase() === "show") {
-              const rect = btn.getBoundingClientRect();
-              if (rect.width > 0 && rect.height > 0) {
-                return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, strategy: "b2b" };
-              }
-            }
-          }
-          container = container.parentElement;
-          if (!container) break;
-        }
-      }
-
-      // Fallback: click the first visible "Show" button on the page
-      for (const el of all) {
-        const txt = el.textContent.trim().toLowerCase();
-        if (txt === "show" && el.offsetParent !== null) {
-          const rect = el.getBoundingClientRect();
-          if (rect.width > 0 && rect.height > 0) {
-            return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, strategy: "first-show" };
-          }
-        }
-      }
-
-      return null;
+    const showBtn = await page.evaluate(() => {
+      const plugin = document.querySelector("#KasprPlugin");
+      if (!plugin) return null;
+      if (!plugin.innerText.includes("***@")) return null; // already unmasked
+      const btn = plugin.querySelector("button.show-btn");
+      if (!btn) return null;
+      const rect = btn.getBoundingClientRect();
+      return rect.width > 0 ? { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 } : null;
     });
-
-    if (showPos) {
-      await page.mouse.click(showPos.x, showPos.y);
-      console.log(`  Clicked 'Show' for B2B email (strategy: ${showPos.strategy}) — waiting for data...`);
-      await sleep(5000);
-    } else {
-      console.log("  No 'Show' button found (may already be revealed).");
+    if (showBtn) {
+      await page.mouse.click(showBtn.x, showBtn.y);
+      console.log("  Still masked — clicked Show button as fallback");
       await sleep(2000);
     }
-  } catch (err) {
-    console.log(`  Error clicking show: ${err.message}`);
-    await sleep(2000);
-  }
+  } catch {}
 
-  // Step 3: Extract emails from anywhere on the page
+  // Step 3: Extract emails from inside #KasprPlugin
   try {
     emails = await page.evaluate(() => {
+      const plugin = document.querySelector("#KasprPlugin");
+      if (!plugin) return [];
       const found = new Set();
       const emailRegex = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
 
-      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      const walker = document.createTreeWalker(plugin, NodeFilter.SHOW_TEXT);
       while (walker.nextNode()) {
         const text = walker.currentNode.textContent;
         if (text.includes("@")) {
@@ -396,12 +387,12 @@ async function extractKasprData(page) {
         }
       }
 
-      document.querySelectorAll('a[href^="mailto:"]').forEach((el) => {
+      plugin.querySelectorAll('a[href^="mailto:"]').forEach((el) => {
         const email = el.href.replace("mailto:", "").split("?")[0].trim();
         if (email.includes("@")) found.add(email.toLowerCase());
       });
 
-      const ignore = ["@linkedin.com", "@licdn.com", "noreply@", "support@"];
+      const ignore = ["@linkedin.com", "@licdn.com", "noreply@", "support@", "@kaspr"];
       return [...found].filter((e) => !ignore.some((i) => e.includes(i)));
     });
   } catch (err) {
@@ -460,8 +451,9 @@ async function main() {
   }
 
   const batch = urlsToProcess.slice(0, CONFIG.maxProfiles);
-  console.log(`Processing ${batch.length} profiles in this run (max: ${CONFIG.maxProfiles})`);
+  console.log(`Processing ${batch.length} profiles in this run (max: ${CONFIG.maxProfiles})\n`);
 
+  // Launch browser with Kaspr extension
   const browser = await puppeteer.launch({
     headless: false,
     args: [
@@ -469,80 +461,87 @@ async function main() {
       `--load-extension=${CONFIG.extensionPath}`,
       "--no-sandbox",
       "--disable-setuid-sandbox",
-      "--start-maximized",
       "--profile-directory=Default",
     ],
     userDataDir: CONFIG.userDataDir,
     defaultViewport: null,
   });
 
-  const page = await browser.newPage();
+  await sleep(3000);
 
-  await page.setUserAgent(
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-  );
+  const pages = await browser.pages();
+  const page = pages[0] || (await browser.newPage());
 
-  console.log("Navigating to LinkedIn...");
-  await page.goto("https://www.linkedin.com/feed/", { waitUntil: "domcontentloaded", timeout: 60000 });
-
-  const currentUrl = page.url();
-  if (currentUrl.includes("/login") || currentUrl.includes("/authwall") || currentUrl.includes("/checkpoint")) {
-    console.log("\n╔══════════════════════════════════════════════════════════╗");
-    console.log("║  Please log in to LinkedIn manually in the browser.     ║");
-    console.log("║  The script will continue once you're on the feed page. ║");
-    console.log("╚══════════════════════════════════════════════════════════╝\n");
-
-    const loginTimeout = Date.now() + 300_000;
-    while (Date.now() < loginTimeout) {
-      await sleep(3000);
-      const url = page.url();
-      if (url.includes("/feed") || url.includes("/in/") || url.includes("/mynetwork")) {
-        break;
-      }
+  // Enable request interception — serve a fake LinkedIn page so we don't
+  // actually hit LinkedIn, but the extension content script still activates
+  await page.setRequestInterception(true);
+  page.on("request", (req) => {
+    const reqUrl = req.url();
+    if (reqUrl.includes("linkedin.com/in/")) {
+      const profileSlug = reqUrl.match(/linkedin\.com\/in\/([^/?#]+)/)?.[1] || "unknown";
+      req.respond({
+        status: 200,
+        contentType: "text/html",
+        body: `<!DOCTYPE html>
+<html><head><title>${profileSlug} | LinkedIn</title></head>
+<body>
+  <div class="scaffold-layout">
+    <div class="pv-top-card">
+      <h1>${profileSlug}</h1>
+      <div class="pv-top-card--list">LinkedIn Member</div>
+    </div>
+  </div>
+</body></html>`,
+      });
+    } else if (
+      reqUrl.includes("linkedin.com") &&
+      !reqUrl.includes("kaspr") &&
+      !reqUrl.includes("api.kaspr.io")
+    ) {
+      req.abort();
+    } else {
+      req.continue();
     }
-    await sleep(3000);
-    console.log("Logged in successfully!");
-  } else {
-    console.log("Already logged into LinkedIn.");
-  }
+  });
+
+  console.log("Browser ready with request interception.\n");
 
   // Process each profile
   let processed = 0;
   for (const url of batch) {
     processed++;
-    console.log(`\n[${processed}/${batch.length}] Visiting: ${url}`);
+    const profileId = url.match(/linkedin\.com\/in\/([^/?#]+)/)?.[1];
+    if (!profileId) {
+      console.log(`[${processed}/${batch.length}] Invalid URL: ${url}`);
+      continue;
+    }
+
+    console.log(`\n[${processed}/${batch.length}] ${profileId}`);
 
     try {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
-      await sleep(4000); // Let the page and Kaspr extension settle
-
-      const name = await extractProfileName(page);
-      console.log(`  Name: ${name || "(not found)"}`);
+      await page.goto(`https://www.linkedin.com/in/${profileId}/`, {
+        waitUntil: "domcontentloaded",
+        timeout: 10000,
+      });
+      await sleep(500); // Let Kaspr extension settle
 
       const { emails, phones } = await extractKasprData(page);
 
-      const result = {
+      console.log(
+        `  ${profileId} → ${emails.length > 0 ? emails.join(", ") : "no email"}`
+      );
+
+      existingResults[url] = {
         linkedin_url: url,
-        name,
+        name: profileId,
         emails: emails.join("; "),
         phones: phones.join("; "),
         status: emails.length > 0 ? "found" : "no_email",
         scraped_at: new Date().toISOString(),
       };
-
-      existingResults[url] = result;
       saveResult(existingResults);
-
-      if (emails.length > 0) {
-        console.log(`  ✅ Emails: ${emails.join(", ")}`);
-      } else {
-        console.log("  ❌ No emails found.");
-      }
-      if (phones.length > 0) {
-        console.log(`  Phones: ${phones.join(", ")}`);
-      }
     } catch (err) {
-      console.error(`  Error processing ${url}: ${err.message}`);
+      console.error(`  Error: ${err.message}`);
       existingResults[url] = {
         linkedin_url: url,
         name: "",

@@ -1,0 +1,7 @@
+node_modules/
+chrome-data/
+.chrome_profile/
+.chrome_privacy_profile.*/
+.helium_test_profile.*/
+*.csv
+!linkedin_urls.csv
