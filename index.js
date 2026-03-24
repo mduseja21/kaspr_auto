@@ -7,14 +7,14 @@ const path = require("path");
 
 puppeteer.use(StealthPlugin());
 
+const KASPR_EXTENSION_ID = "kkfgenjfpmoegefcckjklfjieepogfhg";
+const RESOLVED_EXTENSION = resolveKasprExtensionPath();
+
 // ─── CONFIG ───────────────────────────────────────────────────────────
 const CONFIG = {
-  extensionPath:
-    process.env.KASPR_EXTENSION_PATH ||
-    path.join(
-      process.env.HOME,
-      "Library/Application Support/Google/Chrome/Default/Extensions/kkfgenjfpmoegefcckjklfjieepogfhg/2.0.19_0"
-    ),
+  extensionPath: RESOLVED_EXTENSION.path,
+  extensionSource: RESOLVED_EXTENSION.source,
+  extensionCandidates: RESOLVED_EXTENSION.candidates,
 
   userDataDir:
     process.env.CHROME_USER_DATA_DIR ||
@@ -39,6 +39,176 @@ const CONFIG = {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function expandHome(filePath) {
+  if (!filePath) return null;
+  if (filePath === "~") return process.env.HOME;
+  if (filePath.startsWith("~/")) {
+    return path.join(process.env.HOME, filePath.slice(2));
+  }
+  return filePath;
+}
+
+function isDirectory(filePath) {
+  try {
+    return fs.statSync(filePath).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function isExtensionDirectory(filePath) {
+  return isDirectory(filePath) && fs.existsSync(path.join(filePath, "manifest.json"));
+}
+
+function compareVersionLikeStrings(a, b) {
+  const aParts = a.split(/[._-]/);
+  const bParts = b.split(/[._-]/);
+  const maxLength = Math.max(aParts.length, bParts.length);
+
+  for (let i = 0; i < maxLength; i++) {
+    const left = aParts[i] || "";
+    const right = bParts[i] || "";
+    const leftNumber = /^\d+$/.test(left) ? Number(left) : Number.NaN;
+    const rightNumber = /^\d+$/.test(right) ? Number(right) : Number.NaN;
+
+    if (!Number.isNaN(leftNumber) && !Number.isNaN(rightNumber) && leftNumber !== rightNumber) {
+      return leftNumber - rightNumber;
+    }
+
+    const textCompare = left.localeCompare(right);
+    if (textCompare !== 0) {
+      return textCompare;
+    }
+  }
+
+  return 0;
+}
+
+function listCandidateUserDataDirs() {
+  const candidates = [
+    process.env.CHROME_USER_DATA_DIR,
+    path.join(process.env.HOME, "Library/Application Support/Google/Chrome"),
+    path.join(process.env.HOME, "Library/Application Support/net.imput.helium"),
+    path.join(process.cwd(), "chrome-data"),
+    path.join(process.cwd(), ".chrome_profile"),
+  ];
+
+  return [...new Set(candidates.filter(Boolean).map((candidate) => path.resolve(expandHome(candidate))))];
+}
+
+function readConfiguredExtensionPaths(userDataDir) {
+  const defaultProfileDir = path.join(userDataDir, "Default");
+  const preferenceFiles = ["Secure Preferences", "Preferences"];
+  const configuredPaths = [];
+
+  for (const fileName of preferenceFiles) {
+    const preferencePath = path.join(defaultProfileDir, fileName);
+    if (!fs.existsSync(preferencePath)) continue;
+
+    try {
+      const raw = JSON.parse(fs.readFileSync(preferencePath, "utf8"));
+      const configuredPath = raw?.extensions?.settings?.[KASPR_EXTENSION_ID]?.path;
+      if (!configuredPath) continue;
+
+      if (path.isAbsolute(configuredPath)) {
+        configuredPaths.push({
+          path: configuredPath,
+          source: `${preferencePath} (absolute configured path)`,
+        });
+        continue;
+      }
+
+      configuredPaths.push({
+        path: path.resolve(defaultProfileDir, configuredPath),
+        source: `${preferencePath} (relative to Default profile)`,
+      });
+      configuredPaths.push({
+        path: path.resolve(defaultProfileDir, "Extensions", configuredPath),
+        source: `${preferencePath} (relative to Default/Extensions)`,
+      });
+      configuredPaths.push({
+        path: path.resolve(userDataDir, configuredPath),
+        source: `${preferencePath} (relative to user data dir)`,
+      });
+    } catch {}
+  }
+
+  return configuredPaths;
+}
+
+function listInstalledExtensionPaths(userDataDir) {
+  const extensionRoots = [
+    path.join(userDataDir, "Default", "Extensions", KASPR_EXTENSION_ID),
+    path.join(userDataDir, "Extensions", KASPR_EXTENSION_ID),
+  ];
+  const foundPaths = [];
+
+  for (const extensionRoot of extensionRoots) {
+    if (isExtensionDirectory(extensionRoot)) {
+      foundPaths.push(extensionRoot);
+    }
+
+    if (!isDirectory(extensionRoot)) continue;
+
+    const versionDirs = fs
+      .readdirSync(extensionRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => path.join(extensionRoot, entry.name))
+      .filter((candidatePath) => isExtensionDirectory(candidatePath))
+      .sort((left, right) =>
+        compareVersionLikeStrings(path.basename(right), path.basename(left))
+      );
+
+    foundPaths.push(...versionDirs);
+  }
+
+  return foundPaths;
+}
+
+function resolveKasprExtensionPath() {
+  const explicitPath = expandHome(process.env.KASPR_EXTENSION_PATH);
+  if (explicitPath) {
+    const resolvedPath = path.resolve(explicitPath);
+    return {
+      path: isExtensionDirectory(resolvedPath) ? resolvedPath : null,
+      source: isExtensionDirectory(resolvedPath) ? "KASPR_EXTENSION_PATH" : null,
+      candidates: [{ path: resolvedPath, source: "KASPR_EXTENSION_PATH" }],
+    };
+  }
+
+  const candidates = [];
+  const seen = new Set();
+
+  function addCandidate(candidatePath, source) {
+    if (!candidatePath) return;
+
+    const resolvedPath = path.resolve(expandHome(candidatePath));
+    if (seen.has(resolvedPath)) return;
+
+    seen.add(resolvedPath);
+    candidates.push({ path: resolvedPath, source });
+  }
+
+  addCandidate(path.join(process.cwd(), "kaspr_extension"), "repo-local unpacked extension");
+
+  for (const userDataDir of listCandidateUserDataDirs()) {
+    for (const configuredPath of readConfiguredExtensionPaths(userDataDir)) {
+      addCandidate(configuredPath.path, configuredPath.source);
+    }
+
+    for (const installedPath of listInstalledExtensionPaths(userDataDir)) {
+      addCandidate(installedPath, `Installed Kaspr extension under ${userDataDir}`);
+    }
+  }
+
+  const match = candidates.find((candidate) => isExtensionDirectory(candidate.path));
+  return {
+    path: match ? match.path : null,
+    source: match ? match.source : null,
+    candidates,
+  };
 }
 
 function randomDelay() {
@@ -254,8 +424,17 @@ async function extractProfileName(page) {
 
 async function main() {
   if (!CONFIG.extensionPath) {
-    console.error("ERROR: Set KASPR_EXTENSION_PATH");
+    console.error("ERROR: Could not find a usable Kaspr extension path.");
+    console.error("Set KASPR_EXTENSION_PATH or restore one of these candidate locations:");
+    for (const candidate of CONFIG.extensionCandidates) {
+      console.error(`  - ${candidate.path} (${candidate.source})`);
+    }
     process.exit(1);
+  }
+
+  console.log(`Using Kaspr extension: ${CONFIG.extensionPath}`);
+  if (CONFIG.extensionSource) {
+    console.log(`Extension source: ${CONFIG.extensionSource}`);
   }
 
   if (!fs.existsSync(CONFIG.inputCsv)) {
@@ -283,7 +462,6 @@ async function main() {
   const batch = urlsToProcess.slice(0, CONFIG.maxProfiles);
   console.log(`Processing ${batch.length} profiles in this run (max: ${CONFIG.maxProfiles})`);
 
-  // Launch browser with extension
   const browser = await puppeteer.launch({
     headless: false,
     args: [
@@ -304,7 +482,6 @@ async function main() {
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
   );
 
-  // First, check if we're logged into LinkedIn
   console.log("Navigating to LinkedIn...");
   await page.goto("https://www.linkedin.com/feed/", { waitUntil: "domcontentloaded", timeout: 60000 });
 
