@@ -5,3 +5,15 @@ chrome-data/
 .helium_test_profile.*/
 *.csv
 !linkedin_urls.csv
+.DS_Store
+run.log
+auto_email/.env
+auto_email/.gmail_token.json
+auto_email/.gmail_token.json.bak*
+auto_email/.outlook_token_cache.json
+auto_email/.outlook_token_cache.json.bak*
+auto_email/gmail_credentials.json
+auto_email/venv/
+auto_email/__pycache__/
+auto_email/.claude/
+auto_email/send_log.txt

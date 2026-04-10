@@ -3,7 +3,14 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
+    "start": "PIPELINE_MODE=full node index.js",
+    "mode:full": "PIPELINE_MODE=full node index.js",
+    "mode:scrape-only": "PIPELINE_MODE=scrape node index.js",
+    "mode:email-only": "PIPELINE_MODE=email node index.js",
+    "contacts:prepare": "python3 auto_email/prepare_contacts.py",
+    "email:followup": "./auto_email/venv/bin/python auto_email/run_after_scrape.py",
+    "email:send": "./auto_email/venv/bin/python auto_email/send_emails.py",
+    "email:dry-run": "./auto_email/venv/bin/python auto_email/send_emails.py --dry-run",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
