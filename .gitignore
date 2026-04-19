@@ -1,4 +1,5 @@
 node_modules/
+runtime/
 chrome-data/
 .chrome_profile/
 .chrome_privacy_profile.*/

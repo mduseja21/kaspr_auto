@@ -7,6 +7,9 @@
     "mode:full": "PIPELINE_MODE=full node index.js",
     "mode:scrape-only": "PIPELINE_MODE=scrape node index.js",
     "mode:email-only": "PIPELINE_MODE=email node index.js",
+    "mode:apollo-only": "PIPELINE_MODE=apollo-only node index.js",
+    "mode:apollo-full": "PIPELINE_MODE=apollo-full node index.js",
+    "apollo:fetch-browser": "npx camoufox-js fetch",
     "contacts:prepare": "python3 auto_email/prepare_contacts.py",
     "email:followup": "./auto_email/venv/bin/python auto_email/run_after_scrape.py",
     "email:send": "./auto_email/venv/bin/python auto_email/send_emails.py",
@@ -18,8 +21,10 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "camoufox-js": "^0.10.2",
     "csv-parse": "^6.2.1",
     "csv-stringify": "^6.7.0",
+    "playwright-core": "^1.59.1",
     "puppeteer": "^24.40.0",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2"

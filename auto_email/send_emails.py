@@ -244,10 +244,10 @@ def main():
         help="Preview emails without sending",
     )
     parser.add_argument(
-        "--pace", type=float, default=0,
+        "--pace", type=float, default=0.4,
         help="Average minutes between emails (adds random jitter ±40%%). "
              "E.g. --pace 0.5 sends about every 18-42 seconds, "
-             "--pace 3 sends ~1 email every 2-4 minutes. 0 = no delay.",
+             "--pace 3 sends ~1 email every 2-4 minutes. Default is 0.4. 0 = no delay.",
     )
     parser.add_argument(
         "--max", type=int, default=0,
