@@ -1705,7 +1705,8 @@ async function runApolloScrape(config) {
   const canonicalRows = [...deduped.values()];
   writeCanonicalRows(config.canonicalOutputCsv, canonicalRows);
 
-  clearApolloProgress(config.rawOutputDir);
+  // Keep progress so next run with different titles skips already-completed combos
+  // clearApolloProgress(config.rawOutputDir);
 
   console.log(`\nApollo raw output dir: ${config.rawOutputDir}`);
   console.log(`Apollo canonical output: ${config.canonicalOutputCsv}`);
