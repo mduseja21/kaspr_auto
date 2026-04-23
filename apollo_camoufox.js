@@ -15,6 +15,7 @@ const ORG_MATCH_REPORT_COLUMNS = [
 ];
 const APOLLO_PAGE_PARAM = "page";
 const APOLLO_ORG_PARAM = "organizationIds[]";
+const APOLLO_TITLE_PARAM = "personTitles[]";
 const APOLLO_BOOTSTRAP_URL = "https://app.apollo.io/#/people";
 const APOLLO_COMPANY_SEARCH_PATH = "/api/v1/mixed_companies/search";
 const APOLLO_COMPANY_LOOKUP_PER_PAGE = 5;
@@ -148,6 +149,46 @@ function cleanupRawOutputDir(dirPath, prefix) {
   }
 }
 
+function getProgressPath(rawOutputDir) {
+  return path.join(rawOutputDir, "apollo_progress.json");
+}
+
+function loadApolloProgress(rawOutputDir) {
+  const progressPath = getProgressPath(rawOutputDir);
+  if (!fs.existsSync(progressPath)) return { completedUrls: {} };
+  try {
+    return JSON.parse(fs.readFileSync(progressPath, "utf-8"));
+  } catch {
+    return { completedUrls: {} };
+  }
+}
+
+function saveApolloProgress(rawOutputDir, progress) {
+  ensureDirectory(rawOutputDir);
+  fs.writeFileSync(getProgressPath(rawOutputDir), JSON.stringify(progress, null, 2));
+}
+
+function clearApolloProgress(rawOutputDir) {
+  const progressPath = getProgressPath(rawOutputDir);
+  if (fs.existsSync(progressPath)) fs.unlinkSync(progressPath);
+}
+
+function extractApolloUrlKey(url) {
+  try {
+    const parsed = new URL(url);
+    const hashQuery = (parsed.hash || "").replace(/^#\/people\??/, "");
+    const params = new URLSearchParams(hashQuery);
+    return {
+      orgId: params.get(APOLLO_ORG_PARAM) || "",
+      title: params.get(APOLLO_TITLE_PARAM) || "",
+      page: parseInt(params.get(APOLLO_PAGE_PARAM) || "1", 10),
+      comboKey: `${params.get(APOLLO_ORG_PARAM) || ""}::${params.get(APOLLO_TITLE_PARAM) || ""}`,
+    };
+  } catch {
+    return { orgId: "", title: "", page: 1, comboKey: "" };
+  }
+}
+
 function randomIntBetween(min, max) {
   const normalizedMin = Math.max(0, Number(min) || 0);
   const normalizedMax = Math.max(normalizedMin, Number(max) || normalizedMin);
@@ -216,10 +257,26 @@ function extractApolloOrganizationIds(orderedEntries) {
   return orgIds;
 }
 
-function buildApolloUrlForOrgAndPage(parsedUrl, orgId, pageNumber) {
+function extractApolloPersonTitles(orderedEntries) {
+  const seen = new Set();
+  const titles = [];
+
+  for (const [key, value] of orderedEntries) {
+    if (key !== APOLLO_TITLE_PARAM) continue;
+    const normalized = normalizeCell(value);
+    if (!normalized || seen.has(normalized.toLowerCase())) continue;
+    seen.add(normalized.toLowerCase());
+    titles.push(normalized);
+  }
+
+  return titles;
+}
+
+function buildApolloUrlForOrgAndPage(parsedUrl, orgId, pageNumber, title) {
   const params = new URLSearchParams();
   let insertedPage = false;
   let insertedOrg = false;
+  let insertedTitle = false;
 
   for (const [key, value] of parsedUrl.orderedEntries) {
     if (key === APOLLO_PAGE_PARAM) {
@@ -238,6 +295,14 @@ function buildApolloUrlForOrgAndPage(parsedUrl, orgId, pageNumber) {
       continue;
     }
 
+    if (title && key === APOLLO_TITLE_PARAM) {
+      if (!insertedTitle) {
+        params.append(APOLLO_TITLE_PARAM, title);
+        insertedTitle = true;
+      }
+      continue;
+    }
+
     params.append(key, value);
   }
 
@@ -246,6 +311,9 @@ function buildApolloUrlForOrgAndPage(parsedUrl, orgId, pageNumber) {
   }
   if (!insertedOrg) {
     params.append(APOLLO_ORG_PARAM, orgId);
+  }
+  if (title && !insertedTitle) {
+    params.append(APOLLO_TITLE_PARAM, title);
   }
 
   const nextUrl = new URL(parsedUrl.url.toString());
@@ -266,15 +334,27 @@ function buildApolloBatchFromOrganizationIds(templateUrl, organizationIds, maxPa
     );
   }
 
+  const titles = extractApolloPersonTitles(parsedUrl.orderedEntries);
+  const fanOutByTitle = titles.length > 1;
+
   const urls = [];
   for (const orgId of orgIds) {
-    for (let pageNumber = 1; pageNumber <= normalizedMaxPages; pageNumber++) {
-      urls.push(buildApolloUrlForOrgAndPage(parsedUrl, orgId, pageNumber));
+    if (fanOutByTitle) {
+      for (const title of titles) {
+        for (let pageNumber = 1; pageNumber <= normalizedMaxPages; pageNumber++) {
+          urls.push(buildApolloUrlForOrgAndPage(parsedUrl, orgId, pageNumber, title));
+        }
+      }
+    } else {
+      for (let pageNumber = 1; pageNumber <= normalizedMaxPages; pageNumber++) {
+        urls.push(buildApolloUrlForOrgAndPage(parsedUrl, orgId, pageNumber, null));
+      }
     }
   }
 
   return {
     orgIds,
+    titles,
     pageCount: normalizedMaxPages,
     urls,
   };
@@ -1114,6 +1194,19 @@ async function hydrateApolloRowsWithLinkedIn(page, rows, config) {
   return hydratedRows.filter((row) => row.some(Boolean));
 }
 
+function readRawCsvRows(filePath) {
+  if (!fs.existsSync(filePath)) return [];
+  const raw = stripBom(fs.readFileSync(filePath, "utf-8"));
+  if (!normalizeCell(raw)) return [];
+  return parse(raw, {
+    columns: false,
+    skip_empty_lines: true,
+    trim: true,
+    relax_column_count: true,
+    relax_quotes: true,
+  });
+}
+
 function writeRawRows(filePath, rawRows) {
   const normalizedRows = rawRows
     .map((row) => trimTrailingEmptyCells(row.map(normalizeCell)))
@@ -1164,70 +1257,130 @@ async function runApolloScrape(config) {
   }
 
   const batch = urls.slice(0, config.maxUrls);
-  cleanupRawOutputDir(config.rawOutputDir, config.rawFilePrefix);
+  const progress = loadApolloProgress(config.rawOutputDir);
+  const skippedCount = batch.filter((url) => progress.completedUrls[url]).length;
 
-  console.log(`Apollo stage: ${batch.length} Apollo URL(s) to process (max: ${config.maxUrls})`);
+  if (skippedCount === batch.length) {
+    console.log(`Apollo stage: all ${batch.length} URL(s) already completed. Reloading raw output.`);
+  } else if (skippedCount > 0) {
+    console.log(
+      `Apollo stage: ${batch.length} URL(s) total, ${skippedCount} already completed, ${batch.length - skippedCount} remaining.`
+    );
+  } else {
+    cleanupRawOutputDir(config.rawOutputDir, config.rawFilePrefix);
+    console.log(`Apollo stage: ${batch.length} Apollo URL(s) to process (max: ${config.maxUrls})`);
+  }
 
-  const { context, page } = await openApolloPage(config, null);
   const allRawRows = [];
   const rawFiles = [];
 
-  try {
-    for (let index = 0; index < batch.length; index++) {
-      const url = batch[index];
-      const rawFilePath = path.join(
-        config.rawOutputDir,
-        buildRawFileName(config.rawFilePrefix, index + 1)
-      );
-
-      console.log(`\n[Apollo ${index + 1}/${batch.length}] ${url}`);
-
-      let rawRows = [];
-      let attempt = 0;
-      while (attempt < 2) {
-        try {
-          await page.goto(url, {
-            waitUntil: "domcontentloaded",
-            timeout: config.pageTimeoutMs,
-          });
-          await waitRandomActionDelay(page, config, "after Apollo navigation");
-
-          await assertApolloSessionReady(page);
-
-          const foundResults = await waitForApolloResults(page, config.resultsSelectorTimeoutMs);
-          if (!foundResults) {
-            console.log("  Apollo results did not render before timeout. Capturing current page anyway...");
-            await assertApolloSessionReady(page);
-          }
-
-          const visibleRows = await extractApolloVisibleRows(page);
-          rawRows = await hydrateApolloRowsWithLinkedIn(page, visibleRows, config);
-          console.log(`  Captured ${rawRows.length} raw Apollo row(s).`);
-          break;
-        } catch (error) {
-          const retryable = /timeout|ERR_ABORTED|Navigation/i.test(error?.message || "");
-          const shouldRetry = retryable && attempt === 0;
-
-          if (shouldRetry) {
-            console.log(`  Apollo navigation failed (${error.message}). Retrying once...`);
-            attempt++;
-            continue;
-          }
-
-          throw error;
-        }
-      }
-
-      writeRawRows(rawFilePath, rawRows);
+  // Reload raw rows from previously completed URLs
+  for (let index = 0; index < batch.length; index++) {
+    const url = batch[index];
+    if (!progress.completedUrls[url]) continue;
+    const rawFilePath = path.join(
+      config.rawOutputDir,
+      buildRawFileName(config.rawFilePrefix, index + 1)
+    );
+    if (fs.existsSync(rawFilePath)) {
+      const existing = readRawCsvRows(rawFilePath);
+      allRawRows.push(...existing);
       rawFiles.push(rawFilePath);
-      allRawRows.push(...rawRows);
     }
-  } finally {
-    await context.close();
+  }
+
+  // Process remaining URLs
+  const pending = batch.filter((url) => !progress.completedUrls[url]);
+  const exhaustedCombos = new Set();
+
+  // Detect combos already exhausted from previous progress
+  for (const [url, info] of Object.entries(progress.completedUrls)) {
+    if (info.rowCount === 0) {
+      const { comboKey } = extractApolloUrlKey(url);
+      if (comboKey) exhaustedCombos.add(comboKey);
+    }
+  }
+
+  if (pending.length > 0) {
+    const { context, page } = await openApolloPage(config, null);
+
+    try {
+      for (let index = 0; index < batch.length; index++) {
+        const url = batch[index];
+        if (progress.completedUrls[url]) continue;
+
+        const urlKey = extractApolloUrlKey(url);
+        if (urlKey.comboKey && exhaustedCombos.has(urlKey.comboKey)) {
+          console.log(`\n[Apollo ${index + 1}/${batch.length}] SKIP page ${urlKey.page} (earlier page was empty for this org+title)`);
+          progress.completedUrls[url] = { completedAt: new Date().toISOString(), rowCount: 0, skipped: true };
+          saveApolloProgress(config.rawOutputDir, progress);
+          continue;
+        }
+
+        const rawFilePath = path.join(
+          config.rawOutputDir,
+          buildRawFileName(config.rawFilePrefix, index + 1)
+        );
+
+        console.log(`\n[Apollo ${index + 1}/${batch.length}] ${url}`);
+
+        let rawRows = [];
+        let attempt = 0;
+        while (attempt < 2) {
+          try {
+            await page.goto(url, {
+              waitUntil: "domcontentloaded",
+              timeout: config.pageTimeoutMs,
+            });
+            await waitRandomActionDelay(page, config, "after Apollo navigation");
+
+            await assertApolloSessionReady(page);
+
+            const foundResults = await waitForApolloResults(page, config.resultsSelectorTimeoutMs);
+            if (!foundResults) {
+              console.log("  Apollo results did not render before timeout. Capturing current page anyway...");
+              await assertApolloSessionReady(page);
+            }
+
+            const visibleRows = await extractApolloVisibleRows(page);
+            rawRows = await hydrateApolloRowsWithLinkedIn(page, visibleRows, config);
+            console.log(`  Captured ${rawRows.length} raw Apollo row(s).`);
+            break;
+          } catch (error) {
+            const retryable = /timeout|ERR_ABORTED|Navigation/i.test(error?.message || "");
+            const shouldRetry = retryable && attempt === 0;
+
+            if (shouldRetry) {
+              console.log(`  Apollo navigation failed (${error.message}). Retrying once...`);
+              attempt++;
+              continue;
+            }
+
+            throw error;
+          }
+        }
+
+        if (rawRows.length === 0 && urlKey.comboKey) {
+          exhaustedCombos.add(urlKey.comboKey);
+        }
+
+        writeRawRows(rawFilePath, rawRows);
+        rawFiles.push(rawFilePath);
+        allRawRows.push(...rawRows);
+
+        progress.completedUrls[url] = { completedAt: new Date().toISOString(), rowCount: rawRows.length };
+        saveApolloProgress(config.rawOutputDir, progress);
+      }
+    } finally {
+      await context.close();
+    }
   }
 
   const canonicalRows = buildCanonicalRows(allRawRows);
   writeCanonicalRows(config.canonicalOutputCsv, canonicalRows);
+
+  // All URLs completed — clear progress so next fresh run starts clean
+  clearApolloProgress(config.rawOutputDir);
 
   console.log(`\nApollo raw output dir: ${config.rawOutputDir}`);
   console.log(`Apollo canonical output: ${config.canonicalOutputCsv}`);
@@ -1256,6 +1409,9 @@ module.exports = {
   buildCanonicalRows,
   buildApolloFirmLookupEntries,
   buildRawFileName,
+  clearApolloProgress,
+  extractApolloUrlKey,
+  loadApolloProgress,
   normalizeApolloCompanyName,
   normalizeApolloFirmCacheKey,
   normalizeLinkedInUrl,
@@ -1264,6 +1420,7 @@ module.exports = {
   readApolloFirmInputCsv,
   readApolloOrgMatchReport,
   runApolloScrape,
+  saveApolloProgress,
   selectApolloOrganizationMatch,
   writeApolloInputCsv,
   writeApolloOrgMatchReport,

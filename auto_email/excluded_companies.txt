@@ -1,7 +1,6 @@
 # Companies to exclude from emailing (one per line)
 # Uses substring matching — e.g. "citadel" matches "Citadel Securities", "Citadel LLC", etc.
 voleon
-citadel
 goldman
 hls
 art capital
