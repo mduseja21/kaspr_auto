@@ -1675,20 +1675,6 @@ async function runApolloScrape(config) {
 
         if (comboCanonical.length > 0) {
           successCount++;
-          if (successCount % SESSION_ROTATION_INTERVAL === 0) {
-            console.log(`\n  Session rotation after ${successCount} successful combos. Refreshing browser...`);
-            await context.close();
-            ({ context, page } = await openApolloPage(config, APOLLO_BOOTSTRAP_URL));
-          }
-        }
-
-        combosSinceBreak++;
-        if (combosSinceBreak >= nextBreakAt) {
-          const breakMs = randomIntBetween(120000, 300000);
-          console.log(`\n  Human-like break: pausing ${(breakMs / 60000).toFixed(1)} min...`);
-          await new Promise((r) => setTimeout(r, breakMs));
-          combosSinceBreak = 0;
-          nextBreakAt = randomIntBetween(BREAK_INTERVAL_MIN, BREAK_INTERVAL_MAX);
         }
       }
     } finally {
