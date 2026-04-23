@@ -9,7 +9,9 @@ from datetime import datetime, timezone
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TRACKING_FILE = os.path.join(BASE_DIR, "tracking.csv")
+TRACKING_DB_FILE = os.path.join(BASE_DIR, "tracking.db")
 ENV_TRACKING_FILE = os.getenv("AUTO_EMAIL_TRACKING_CSV", "").strip()
+ENV_TRACKING_DB = os.getenv("AUTO_EMAIL_TRACKING_DB", "").strip()
 
 MASTER_TRACKING_HEADERS = [
     "linkedinUrl",
@@ -52,7 +54,15 @@ def now_iso():
 
 
 def default_tracking_path():
+    return ENV_TRACKING_DB or TRACKING_DB_FILE
+
+
+def default_tracking_csv_path():
     return ENV_TRACKING_FILE or TRACKING_FILE
+
+
+def is_db_path(path):
+    return str(path or "").endswith(".db")
 
 
 def normalize_text(value):
@@ -235,6 +245,18 @@ def _tracking_header(path):
 
 def load_tracking(path=None):
     path = path or default_tracking_path()
+
+    if is_db_path(path):
+        try:
+            from .tracking_db import open_tracking_db, load_all_rows, close_tracking_db
+        except ImportError:
+            from tracking_db import open_tracking_db, load_all_rows, close_tracking_db
+        conn = open_tracking_db(path)
+        try:
+            return load_all_rows(conn)
+        finally:
+            close_tracking_db(conn)
+
     if not os.path.exists(path):
         return []
 
@@ -261,6 +283,19 @@ def load_tracking(path=None):
 
 def save_tracking(rows, path=None):
     path = path or default_tracking_path()
+
+    if is_db_path(path):
+        try:
+            from .tracking_db import open_tracking_db, upsert_rows, close_tracking_db
+        except ImportError:
+            from tracking_db import open_tracking_db, upsert_rows, close_tracking_db
+        conn = open_tracking_db(path)
+        try:
+            upsert_rows(conn, rows)
+        finally:
+            close_tracking_db(conn)
+        return
+
     normalized_rows = []
     merged = {}
     for row in rows:

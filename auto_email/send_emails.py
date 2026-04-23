@@ -30,6 +30,7 @@ except ImportError:
 try:
     from .master_tracking import (
         default_tracking_path,
+        is_db_path,
         load_tracking,
         normalize_email,
         now_iso,
@@ -39,12 +40,17 @@ try:
 except ImportError:
     from master_tracking import (
         default_tracking_path,
+        is_db_path,
         load_tracking,
         normalize_email,
         now_iso,
         save_tracking,
         upsert_tracking_row,
     )
+try:
+    from .tracking_db import open_tracking_db, close_tracking_db, get_row, get_row_by_email, upsert_row as db_upsert_row
+except ImportError:
+    from tracking_db import open_tracking_db, close_tracking_db, get_row, get_row_by_email, upsert_row as db_upsert_row
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 EXCLUDED_COMPANIES_FILE = os.path.join(BASE_DIR, "excluded_companies.txt")
@@ -125,9 +131,20 @@ def get_recent_company_counts(tracking_rows):
     return counts
 
 
-def already_sent(contact, tracking_rows):
+def already_sent(contact, tracking_rows, db_conn=None):
     target_email = normalize_email(contact.get("email", ""))
     target_linkedin = contact.get("linkedin_url", "").strip()
+
+    if db_conn:
+        if target_linkedin:
+            row = get_row(db_conn, target_linkedin)
+            if row and row.get("email_send_status") in {"sent", "bounced"}:
+                return True
+        if target_email:
+            row = get_row_by_email(db_conn, target_email)
+            if row and row.get("email_send_status") in {"sent", "bounced"}:
+                return True
+        return False
 
     for row in tracking_rows:
         if target_linkedin and row.get("linkedinUrl", "").strip() == target_linkedin:
@@ -149,6 +166,7 @@ def update_tracking_after_attempt(
     sender_account,
     error_message="",
     sent_at="",
+    db_conn=None,
 ):
     timestamp = sent_at or now_iso()
     updates = {
@@ -177,6 +195,14 @@ def update_tracking_after_attempt(
         updates.update({
             "email_last_error": error_message.strip(),
         })
+
+    if db_conn:
+        return db_upsert_row(
+            db_conn,
+            updates,
+            linkedin_url=contact.get("linkedin_url", "").strip(),
+            email=contact.get("email", ""),
+        )
 
     return upsert_tracking_row(
         tracking_rows,
@@ -330,6 +356,10 @@ def main():
             print(f"ERROR: Attachment not found: {path}")
             sys.exit(1)
 
+    db_conn = None
+    if is_db_path(args.tracking):
+        db_conn = open_tracking_db(args.tracking)
+
     sender_states = build_sender_states(args.sender)
     contacts = load_contacts(args.contacts)
     tracking_rows = load_tracking(args.tracking)
@@ -375,7 +405,7 @@ def main():
             if company_counts[company_key] >= MAX_PER_COMPANY:
                 print(f"\nSKIP (limit {MAX_PER_COMPANY}/{LIMIT_WINDOW_DAYS}d): {contact['email']} [{contact['company_name']}]")
                 continue
-            if already_sent(contact, tracking_rows):
+            if already_sent(contact, tracking_rows, db_conn=db_conn):
                 print(f"\nSKIP (already sent): {contact['email']}")
                 continue
             sender_state = sender_states[sender_index % len(sender_states)]
@@ -433,7 +463,7 @@ def main():
                 limited += 1
                 continue
 
-            if already_sent(contact, tracking_rows):
+            if already_sent(contact, tracking_rows, db_conn=db_conn):
                 print(f"SKIP (already sent): {email_addr}")
                 skipped += 1
                 continue
@@ -459,8 +489,10 @@ def main():
                     status="sent",
                     sender_account=provider["address"],
                     sent_at=now_iso(),
+                    db_conn=db_conn,
                 )
-                save_tracking(tracking_rows, args.tracking)
+                if not db_conn:
+                    save_tracking(tracking_rows, args.tracking)
                 company_counts[company_key] += 1
                 print(f"SENT: {email_addr} [{contact['company_name']}] via {provider['address']}")
                 sent += 1
@@ -484,8 +516,10 @@ def main():
                     sender_account=provider["address"],
                     error_message=str(e),
                     sent_at=now_iso(),
+                    db_conn=db_conn,
                 )
-                save_tracking(tracking_rows, args.tracking)
+                if not db_conn:
+                    save_tracking(tracking_rows, args.tracking)
                 failed += 1
     except StopIteration:
         pass
@@ -493,6 +527,8 @@ def main():
         for state in sender_states:
             if state["server"]:
                 state["server"].quit()
+        if db_conn:
+            close_tracking_db(db_conn)
 
     print("-" * 50)
     print(f"Done. Sent: {sent} | Skipped: {skipped} | Rate-limited: {limited} | Failed: {failed}")

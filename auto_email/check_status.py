@@ -17,6 +17,7 @@ except ImportError:
 try:
     from .master_tracking import (
         default_tracking_path,
+        is_db_path,
         load_tracking as load_master_tracking,
         normalize_email,
         save_tracking,
@@ -24,10 +25,15 @@ try:
 except ImportError:
     from master_tracking import (
         default_tracking_path,
+        is_db_path,
         load_tracking as load_master_tracking,
         normalize_email,
         save_tracking,
     )
+try:
+    from .tracking_db import open_tracking_db, close_tracking_db, upsert_row as db_upsert_row
+except ImportError:
+    from tracking_db import open_tracking_db, close_tracking_db, upsert_row as db_upsert_row
 
 
 def load_tracking(tracking_path):
@@ -148,8 +154,16 @@ def main():
                 updated += 1
 
     if updated:
-        save_tracking(rows, args.tracking)
-        print(f"\nUpdated {updated} entries in tracking.csv")
+        if is_db_path(args.tracking):
+            db_conn = open_tracking_db(args.tracking)
+            try:
+                for row in rows:
+                    db_upsert_row(db_conn, row, linkedin_url=row.get("linkedinUrl", ""))
+            finally:
+                close_tracking_db(db_conn)
+        else:
+            save_tracking(rows, args.tracking)
+        print(f"\nUpdated {updated} entries in tracking")
     else:
         print("\nNo new replies or read receipts found.")
 
