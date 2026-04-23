@@ -788,14 +788,24 @@ async function importApolloFirefoxCookies(context, config) {
   );
 }
 
+function getApolloAddons() {
+  const capsolverDir = path.join(process.cwd(), "runtime", "apollo", "extensions", "capsolver");
+  if (fs.existsSync(path.join(capsolverDir, "manifest.json"))) {
+    return [capsolverDir];
+  }
+  return [];
+}
+
 async function launchApolloContext(config) {
   const { Camoufox } = await import("camoufox-js");
+  const addons = getApolloAddons();
 
   try {
     return await Camoufox({
       headless: config.headless,
       humanize: config.humanize,
       user_data_dir: config.profileDir,
+      addons: addons.length > 0 ? addons : undefined,
     });
   } catch (error) {
     const message = String(error?.message || error);
