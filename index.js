@@ -183,9 +183,9 @@ const CONFIG = {
     false
   ),
   apolloMaxPagesPerOrg: parseInt(process.env.APOLLO_MAX_PAGES_PER_ORG || "5", 10),
-  apolloSettleMs: parseInt(process.env.APOLLO_SETTLE_MS || "3000", 10),
-  apolloActionMinWaitMs: parseInt(process.env.APOLLO_ACTION_MIN_WAIT_MS || "1500", 10),
-  apolloActionMaxWaitMs: parseInt(process.env.APOLLO_ACTION_MAX_WAIT_MS || "4000", 10),
+  apolloSettleMs: parseInt(process.env.APOLLO_SETTLE_MS || "5000", 10),
+  apolloActionMinWaitMs: parseInt(process.env.APOLLO_ACTION_MIN_WAIT_MS || "4000", 10),
+  apolloActionMaxWaitMs: parseInt(process.env.APOLLO_ACTION_MAX_WAIT_MS || "10000", 10),
   apolloPageTimeoutMs: parseInt(process.env.APOLLO_PAGE_TIMEOUT_MS || "30000", 10),
   apolloResultsSelectorTimeoutMs: parseInt(
     process.env.APOLLO_RESULTS_SELECTOR_TIMEOUT_MS || "15000",

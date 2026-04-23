@@ -1465,7 +1465,19 @@ async function runApolloScrape(config) {
   }
 
   if (pending.length > 0) {
-    const { context, page } = await openApolloPage(config, null);
+    let { context, page } = await openApolloPage(config, null);
+
+    const SCRAPE_CONSECUTIVE_EMPTY_THRESHOLD = 3;
+    const SCRAPE_PAUSE_MS = 300000; // 5 minutes
+    const SCRAPE_MAX_PAUSE_RETRIES = 3;
+    const SESSION_ROTATION_INTERVAL = 100;
+    const BREAK_INTERVAL_MIN = 50;
+    const BREAK_INTERVAL_MAX = 80;
+
+    let consecutiveEmpty = 0;
+    let successCount = 0;
+    let urlsSinceBreak = 0;
+    let nextBreakAt = randomIntBetween(BREAK_INTERVAL_MIN, BREAK_INTERVAL_MAX);
 
     try {
       for (let index = 0; index < batch.length; index++) {
@@ -1538,6 +1550,56 @@ async function runApolloScrape(config) {
           exhaustedCombos.add(urlKey.comboKey);
         }
 
+        // Track consecutive empty pages for rate limit detection
+        if (rawRows.length === 0) {
+          consecutiveEmpty++;
+          if (consecutiveEmpty >= SCRAPE_CONSECUTIVE_EMPTY_THRESHOLD) {
+            let recovered = false;
+            for (let pauseAttempt = 1; pauseAttempt <= SCRAPE_MAX_PAUSE_RETRIES; pauseAttempt++) {
+              console.log(
+                `  Possible rate limit (${consecutiveEmpty} consecutive empty pages). Pausing ${(SCRAPE_PAUSE_MS / 60000).toFixed(0)} min (attempt ${pauseAttempt}/${SCRAPE_MAX_PAUSE_RETRIES})...`
+              );
+              await new Promise((r) => setTimeout(r, SCRAPE_PAUSE_MS));
+              console.log("  Refreshing browser session...");
+              await context.close();
+              ({ context, page } = await openApolloPage(config, null));
+              // Retry the current URL
+              try {
+                await page.goto(url, { waitUntil: "domcontentloaded", timeout: config.pageTimeoutMs });
+                if (await detectCloudflareChallenge(page)) {
+                  await waitForCloudflareResolution(page);
+                  await page.goto(url, { waitUntil: "domcontentloaded", timeout: config.pageTimeoutMs });
+                }
+                await waitRandomActionDelay(page, config, "after pause retry navigation");
+                const retryVisible = await extractApolloVisibleRows(page);
+                if (retryVisible.length > 0) {
+                  rawRows = await hydrateApolloRowsWithLinkedIn(page, retryVisible, config);
+                  console.log(`  Recovered after pause! Captured ${rawRows.length} row(s).`);
+                  consecutiveEmpty = 0;
+                  recovered = true;
+                  break;
+                }
+              } catch (retryErr) {
+                console.log(`  Pause retry ${pauseAttempt} failed: ${retryErr.message}`);
+              }
+            }
+            if (!recovered) {
+              console.log("  Could not recover after pauses. Continuing (may be legit empty pages).");
+              consecutiveEmpty = 0;
+            }
+          }
+        } else {
+          consecutiveEmpty = 0;
+          successCount++;
+
+          // Session rotation every N successful scrapes
+          if (successCount % SESSION_ROTATION_INTERVAL === 0) {
+            console.log(`\n  Session rotation after ${successCount} successful scrapes. Refreshing browser...`);
+            await context.close();
+            ({ context, page } = await openApolloPage(config, null));
+          }
+        }
+
         writeRawRows(rawFilePath, rawRows);
         rawFiles.push(rawFilePath);
         allRawRows.push(...rawRows);
@@ -1551,6 +1613,16 @@ async function runApolloScrape(config) {
 
         progress.completedUrls[url] = { completedAt: new Date().toISOString(), rowCount: rawRows.length };
         saveApolloProgress(config.rawOutputDir, progress);
+
+        // Random human-like break
+        urlsSinceBreak++;
+        if (urlsSinceBreak >= nextBreakAt) {
+          const breakMs = randomIntBetween(120000, 300000);
+          console.log(`\n  Human-like break: pausing ${(breakMs / 60000).toFixed(1)} min...`);
+          await new Promise((r) => setTimeout(r, breakMs));
+          urlsSinceBreak = 0;
+          nextBreakAt = randomIntBetween(BREAK_INTERVAL_MIN, BREAK_INTERVAL_MAX);
+        }
       }
     } finally {
       await context.close();
