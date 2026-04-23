@@ -1010,6 +1010,22 @@ async function prepareApolloFirmInput(config) {
       throw new Error(`No firm names found in ${config.firmInputCsv}`);
     }
 
+    const excludedCompanies = Array.isArray(config.excludedCompanies) ? config.excludedCompanies : [];
+    if (excludedCompanies.length > 0) {
+      const beforeCount = firms.length;
+      firms = firms.filter((firm) => {
+        const lower = normalizeCell(firm).toLowerCase();
+        return !excludedCompanies.some((ex) => lower.includes(ex));
+      });
+      const skipped = beforeCount - firms.length;
+      if (skipped > 0) {
+        console.log(`Apollo firm lookup: filtered out ${skipped} excluded firm(s).`);
+      }
+      if (firms.length === 0) {
+        throw new Error("All firms were excluded. Check excluded_companies.txt.");
+      }
+    }
+
     uniqueFirmEntries = buildApolloFirmLookupEntries(firms);
 
     console.log(

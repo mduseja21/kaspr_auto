@@ -383,6 +383,22 @@ function randomDelay() {
   return sleep(delay);
 }
 
+function loadExcludedCompanies() {
+  const filePath = path.join(CONFIG.autoEmailDir, "excluded_companies.txt");
+  if (!fs.existsSync(filePath)) return [];
+  return fs.readFileSync(filePath, "utf-8")
+    .split("\n")
+    .map((line) => line.trim().toLowerCase())
+    .filter((line) => line && !line.startsWith("#"));
+}
+
+function isCompanyExcluded(companyName, excludedCompanies) {
+  if (!excludedCompanies || excludedCompanies.length === 0) return false;
+  const lower = normalizeCell(companyName).toLowerCase();
+  if (!lower) return false;
+  return excludedCompanies.some((ex) => lower.includes(ex));
+}
+
 function readInputCsv(filePath = CONFIG.inputCsv) {
   const rows = readCsvRows(filePath)
     .map((row) => {
@@ -470,7 +486,7 @@ function seedTrackingRowsFromInputRows(trackingMap, rows, sourceStage) {
   return trackingMap;
 }
 
-function buildKasprQueueRows(trackingMap) {
+function buildKasprQueueRows(trackingMap, excludedCompanies) {
   return Object.values(trackingMap)
     .map((row) => {
       const linkedinUrl = normalizeLinkedInUrl(row.linkedinUrl || row[CONFIG.urlColumn] || "");
@@ -486,7 +502,8 @@ function buildKasprQueueRows(trackingMap) {
       };
     })
     .filter(Boolean)
-    .filter((row) => !hasCompletedKasprScrape(row));
+    .filter((row) => !hasCompletedKasprScrape(row))
+    .filter((row) => !isCompanyExcluded(row.Company, excludedCompanies));
 }
 
 function getEmailResultsPath() {
@@ -763,6 +780,7 @@ async function resolveApolloInputCsv() {
       actionMaxWaitMs: CONFIG.apolloActionMaxWaitMs,
       pageTimeoutMs: CONFIG.apolloPageTimeoutMs,
       maxPagesPerOrg: CONFIG.apolloMaxPagesPerOrg,
+      excludedCompanies: loadExcludedCompanies(),
     });
 
     console.log("Apollo firm-name input detected. Using APOLLO_FIRM_INPUT_CSV precedence.");
@@ -986,7 +1004,12 @@ async function main() {
     silent: true,
   });
 
-  const urlsToProcess = buildKasprQueueRows(trackingMap);
+  const excludedCompanies = loadExcludedCompanies();
+  if (excludedCompanies.length > 0) {
+    console.log(`Excluded companies (${excludedCompanies.length}): ${excludedCompanies.join(", ")}`);
+  }
+
+  const urlsToProcess = buildKasprQueueRows(trackingMap, excludedCompanies);
   const trackedCount = Object.keys(trackingMap).length;
   const completedCount = trackedCount - urlsToProcess.length;
   console.log(
