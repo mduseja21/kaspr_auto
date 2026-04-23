@@ -1594,27 +1594,7 @@ async function runApolloScrape(config) {
               break;
             }
 
-            // Enrich with LinkedIn URLs via person detail API only if not in search response
-            let enrichedCount = 0;
-            for (let pIndex = 0; pIndex < people.length; pIndex++) {
-              const person = people[pIndex];
-              if (!person.linkedinUrl && person.personId) {
-                if (enrichedCount > 0) {
-                  await waitRandomActionDelay(page, config, "between person detail fetches");
-                }
-                try {
-                  const payload = await fetchApolloPersonPayload(page, person.personId);
-                  const detail = payload?.person || {};
-                  person.linkedinUrl = normalizeCell(detail.linkedin_url || "");
-                  if (!person.Name) person.Name = normalizeCell(detail.name || `${detail.first_name || ""} ${detail.last_name || ""}`.trim());
-                  if (!person.Title) person.Title = normalizeCell(detail.title || "");
-                  if (!person.Company) person.Company = normalizeCell(detail.organization?.name || "");
-                  enrichedCount++;
-                } catch (detailErr) {
-                  console.log(`  Person detail fetch failed for ${person.personId}: ${detailErr.message}`);
-                }
-              }
-
+            for (const person of people) {
               comboRawRows.push([
                 person.Name || "",
                 person.Title || "",
