@@ -1091,7 +1091,7 @@ async function prepareApolloFirmInput(config) {
       const firmEntry = uniqueFirmEntries[index];
       const cachedRow = orgMatchCache.get(firmEntry.firmCacheKey);
 
-      const isRetryableCache = cachedRow && (cachedRow.matchReason || "").startsWith("lookup_error");
+      const isRetryableCache = cachedRow && cachedRow.status !== "resolved";
       if (cachedRow && !config.forceRefreshOrgMatches && !isRetryableCache) {
         const reusedRow = upsertApolloOrgMatchCache(orgMatchCache, {
           ...cachedRow,
