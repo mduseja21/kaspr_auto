@@ -874,7 +874,7 @@ async function resolveApolloInputCsv() {
   };
 }
 
-async function runApolloStage() {
+async function runApolloStage(db) {
   console.log("Starting Apollo Camoufox stage...");
   const inputConfig = await resolveApolloInputCsv();
   const result = await runApolloScrape({
@@ -892,6 +892,7 @@ async function runApolloStage() {
     rawFilePrefix: CONFIG.apolloRawFilePrefix,
     canonicalOutputCsv: CONFIG.apolloCanonicalOutputCsv,
     maxUrls: CONFIG.apolloMaxUrls,
+    onRowsScraped: db ? (rows) => trackingDb.upsertRows(db, rows, "apollo") : undefined,
   });
   console.log(
     `Apollo stage complete: ${result.canonicalRowCount} canonical LinkedIn row(s) written to ${result.canonicalOutputCsv}`
@@ -993,7 +994,7 @@ async function main() {
     }
 
     if (["apollo-only", "apollo-full"].includes(CONFIG.pipelineMode)) {
-      const apolloResult = await runApolloStage();
+      const apolloResult = await runApolloStage(db);
       scrapeInputCsv = apolloResult.canonicalOutputCsv;
       trackingDb.upsertRows(db, apolloResult.canonicalRows || readCsvRows(apolloResult.canonicalOutputCsv), "apollo");
       trackingMap = trackingDb.loadAllRows(db);

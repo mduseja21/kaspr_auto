@@ -1380,6 +1380,7 @@ async function runApolloScrape(config) {
   const rawFiles = [];
 
   // Reload raw rows from previously completed URLs
+  const reloadedRawRows = [];
   for (let index = 0; index < batch.length; index++) {
     const url = batch[index];
     if (!progress.completedUrls[url]) continue;
@@ -1390,7 +1391,16 @@ async function runApolloScrape(config) {
     if (fs.existsSync(rawFilePath)) {
       const existing = readRawCsvRows(rawFilePath);
       allRawRows.push(...existing);
+      reloadedRawRows.push(...existing);
       rawFiles.push(rawFilePath);
+    }
+  }
+
+  if (reloadedRawRows.length > 0 && typeof config.onRowsScraped === "function") {
+    const reloadedCanonical = buildCanonicalRows(reloadedRawRows);
+    if (reloadedCanonical.length > 0) {
+      config.onRowsScraped(reloadedCanonical);
+      console.log(`Reloaded ${reloadedCanonical.length} canonical row(s) from previous progress into tracking.`);
     }
   }
 
@@ -1472,6 +1482,13 @@ async function runApolloScrape(config) {
         writeRawRows(rawFilePath, rawRows);
         rawFiles.push(rawFilePath);
         allRawRows.push(...rawRows);
+
+        if (rawRows.length > 0 && typeof config.onRowsScraped === "function") {
+          const pageCanonical = buildCanonicalRows(rawRows);
+          if (pageCanonical.length > 0) {
+            config.onRowsScraped(pageCanonical);
+          }
+        }
 
         progress.completedUrls[url] = { completedAt: new Date().toISOString(), rowCount: rawRows.length };
         saveApolloProgress(config.rawOutputDir, progress);
