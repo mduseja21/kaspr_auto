@@ -23,10 +23,12 @@ try:
     from .config import DEFAULT_SENDER, get_provider
     from .outlook_auth import get_oauth2_token
     from .gmail_auth import get_gmail_service, send_email_gmail_api
+    from .prepare_contacts import build_contacts
 except ImportError:
     from config import DEFAULT_SENDER, get_provider
     from outlook_auth import get_oauth2_token
     from gmail_auth import get_gmail_service, send_email_gmail_api
+    from prepare_contacts import build_contacts
 try:
     from .master_tracking import (
         default_tracking_path,
@@ -348,7 +350,25 @@ def main():
         "--max", type=int, default=0,
         help="Max number of emails to send in this run. 0 = no limit.",
     )
+    parser.add_argument(
+        "--watch", action="store_true", default=True,
+        help="Watch mode: poll DB for new eligible contacts after queue is empty.",
+    )
+    parser.add_argument(
+        "--no-watch", action="store_true", default=False,
+        help="Disable watch mode.",
+    )
+    parser.add_argument(
+        "--poll-interval", type=int, default=60,
+        help="Seconds between polls in watch mode (default: 60).",
+    )
+    parser.add_argument(
+        "--max-idle-polls", type=int, default=10,
+        help="Exit after this many consecutive empty polls (default: 10).",
+    )
     args = parser.parse_args()
+    if args.no_watch:
+        args.watch = False
 
     # Validate attachments exist
     for path in args.attach:
@@ -440,88 +460,115 @@ def main():
             server.login(provider["address"], provider["password"])
             state["server"] = server
 
+    if args.watch and db_conn:
+        print(f"Watch mode: polling every {args.poll_interval}s, exits after {args.max_idle_polls} idle polls.")
+
     sent = 0
     skipped = 0
     failed = 0
     limited = 0
     sender_index = 0
+    idle_polls = 0
+    hit_max = False
 
     try:
-        for contact in contacts:
-            email_addr = contact["email"]
-            company_key = contact["company_name"].lower()
+        while True:
+            # In watch mode with DB, rebuild contacts from DB each cycle
+            if db_conn and (sent > 0 or idle_polls > 0):
+                tracking_rows = load_tracking(args.tracking)
+                contacts = build_contacts(tracking_rows)
+                company_counts = get_recent_company_counts(tracking_rows)
 
-            # Check excluded companies
-            if any(ex in company_key for ex in excluded):
-                print(f"SKIP (excluded company): {email_addr} [{contact['company_name']}]")
-                skipped += 1
+            batch_sent = 0
+            for contact in contacts:
+                email_addr = contact["email"]
+                company_key = contact["company_name"].lower()
+
+                if any(ex in company_key for ex in excluded):
+                    continue
+
+                if company_counts[company_key] >= MAX_PER_COMPANY:
+                    limited += 1
+                    continue
+
+                if already_sent(contact, tracking_rows, db_conn=db_conn):
+                    continue
+
+                sender_state = sender_states[sender_index % len(sender_states)]
+                sender_index += 1
+                provider = sender_state["provider"]
+                auth_method = sender_state["auth_method"]
+                subj = render(subject_tpl, contact)
+                body = render(body_tpl, contact)
+
+                try:
+                    if auth_method == "gmail_api":
+                        send_email_gmail_api(sender_state["gmail_service"], provider["address"], email_addr, subj, body, args.attach)
+                    elif auth_method == "oauth2":
+                        send_email_graph(sender_state["token"], provider["address"], email_addr, subj, body, args.attach)
+                    else:
+                        send_email_smtp(sender_state["server"], provider["address"], email_addr, subj, body, args.attach)
+
+                    update_tracking_after_attempt(
+                        tracking_rows,
+                        contact,
+                        status="sent",
+                        sender_account=provider["address"],
+                        sent_at=now_iso(),
+                        db_conn=db_conn,
+                    )
+                    if not db_conn:
+                        save_tracking(tracking_rows, args.tracking)
+                    company_counts[company_key] += 1
+                    print(f"SENT: {email_addr} [{contact['company_name']}] via {provider['address']}")
+                    sent += 1
+                    batch_sent += 1
+
+                    if args.max > 0 and sent >= args.max:
+                        print(f"\nReached --max {args.max}. Stopping.")
+                        hit_max = True
+                        break
+
+                    if args.pace > 0:
+                        delay = args.pace * 60 * random.uniform(0.6, 1.4)
+                        next_time = datetime.now() + __import__('datetime').timedelta(seconds=delay)
+                        print(f"  Waiting {delay/60:.1f} min (next ~{next_time.strftime('%H:%M')})...")
+                        sys.stdout.flush()
+                        time.sleep(delay)
+                except Exception as e:
+                    print(f"FAILED: {email_addr} — {e}")
+                    update_tracking_after_attempt(
+                        tracking_rows,
+                        contact,
+                        status="failed",
+                        sender_account=provider["address"],
+                        error_message=str(e),
+                        sent_at=now_iso(),
+                        db_conn=db_conn,
+                    )
+                    if not db_conn:
+                        save_tracking(tracking_rows, args.tracking)
+                    failed += 1
+
+            if hit_max:
+                break
+
+            if not args.watch or not db_conn:
+                break
+
+            if batch_sent > 0:
+                idle_polls = 0
                 continue
 
-            # Check per-company daily limit
-            if company_counts[company_key] >= MAX_PER_COMPANY:
-                print(f"SKIP (limit {MAX_PER_COMPANY}/{LIMIT_WINDOW_DAYS}d): {email_addr} [{contact['company_name']}]")
-                limited += 1
-                continue
+            idle_polls += 1
+            if idle_polls > args.max_idle_polls:
+                print(f"\nNo new contacts after {args.max_idle_polls} polls. Exiting watch mode.")
+                break
 
-            if already_sent(contact, tracking_rows, db_conn=db_conn):
-                print(f"SKIP (already sent): {email_addr}")
-                skipped += 1
-                continue
-
-            sender_state = sender_states[sender_index % len(sender_states)]
-            sender_index += 1
-            provider = sender_state["provider"]
-            auth_method = sender_state["auth_method"]
-            subj = render(subject_tpl, contact)
-            body = render(body_tpl, contact)
-
-            try:
-                if auth_method == "gmail_api":
-                    send_email_gmail_api(sender_state["gmail_service"], provider["address"], email_addr, subj, body, args.attach)
-                elif auth_method == "oauth2":
-                    send_email_graph(sender_state["token"], provider["address"], email_addr, subj, body, args.attach)
-                else:
-                    send_email_smtp(sender_state["server"], provider["address"], email_addr, subj, body, args.attach)
-
-                update_tracking_after_attempt(
-                    tracking_rows,
-                    contact,
-                    status="sent",
-                    sender_account=provider["address"],
-                    sent_at=now_iso(),
-                    db_conn=db_conn,
-                )
-                if not db_conn:
-                    save_tracking(tracking_rows, args.tracking)
-                company_counts[company_key] += 1
-                print(f"SENT: {email_addr} [{contact['company_name']}] via {provider['address']}")
-                sent += 1
-
-                if args.max > 0 and sent >= args.max:
-                    print(f"\nReached --max {args.max}. Stopping.")
-                    raise StopIteration
-
-                if args.pace > 0:
-                    delay = args.pace * 60 * random.uniform(0.6, 1.4)
-                    next_time = datetime.now() + __import__('datetime').timedelta(seconds=delay)
-                    print(f"  Waiting {delay/60:.1f} min (next ~{next_time.strftime('%H:%M')})...")
-                    sys.stdout.flush()
-                    time.sleep(delay)
-            except Exception as e:
-                print(f"FAILED: {email_addr} — {e}")
-                update_tracking_after_attempt(
-                    tracking_rows,
-                    contact,
-                    status="failed",
-                    sender_account=provider["address"],
-                    error_message=str(e),
-                    sent_at=now_iso(),
-                    db_conn=db_conn,
-                )
-                if not db_conn:
-                    save_tracking(tracking_rows, args.tracking)
-                failed += 1
-    except StopIteration:
+            print(f"\nNo new contacts to email. Watching for new Kaspr results... (poll {idle_polls}/{args.max_idle_polls}, next in {args.poll_interval}s)")
+            sys.stdout.flush()
+            time.sleep(args.poll_interval)
+    except (StopIteration, KeyboardInterrupt):
         pass
     finally:
         for state in sender_states:
