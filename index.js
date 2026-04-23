@@ -84,9 +84,9 @@ const CONFIG = {
 
   // Short setup waits to let the extension attach without dragging the run
   browserReadyDelay: parseInt(process.env.BROWSER_READY_DELAY_MS || "1000", 10),
-  profileSettleDelay: parseInt(process.env.PROFILE_SETTLE_DELAY_MS || "250", 10),
+  profileSettleDelay: parseInt(process.env.PROFILE_SETTLE_DELAY_MS || "500", 10),
   revealPollInterval: parseInt(process.env.REVEAL_POLL_INTERVAL_MS || "250", 10),
-  postShowDelay: parseInt(process.env.POST_SHOW_DELAY_MS || "750", 10),
+  postShowDelay: parseInt(process.env.POST_SHOW_DELAY_MS || "2000", 10),
   pageNavigationTimeout: parseInt(process.env.PAGE_NAVIGATION_TIMEOUT_MS || "10000", 10),
 
   // Max profiles to process per run
