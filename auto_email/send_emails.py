@@ -19,19 +19,38 @@ from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-from config import DEFAULT_SENDER, get_provider
-from outlook_auth import get_oauth2_token
-from gmail_auth import get_gmail_service, send_email_gmail_api
+try:
+    from .config import DEFAULT_SENDER, get_provider
+    from .outlook_auth import get_oauth2_token
+    from .gmail_auth import get_gmail_service, send_email_gmail_api
+except ImportError:
+    from config import DEFAULT_SENDER, get_provider
+    from outlook_auth import get_oauth2_token
+    from gmail_auth import get_gmail_service, send_email_gmail_api
+try:
+    from .master_tracking import (
+        default_tracking_path,
+        load_tracking,
+        normalize_email,
+        now_iso,
+        save_tracking,
+        upsert_tracking_row,
+    )
+except ImportError:
+    from master_tracking import (
+        default_tracking_path,
+        load_tracking,
+        normalize_email,
+        now_iso,
+        save_tracking,
+        upsert_tracking_row,
+    )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-TRACKING_FILE = os.path.join(BASE_DIR, "tracking.csv")
-TRACKING_HEADERS = [
-    "email", "name", "company_name", "sent_at",
-    "sender_account", "status", "read_receipt", "reply_detected", "reply_at",
-]
 EXCLUDED_COMPANIES_FILE = os.path.join(BASE_DIR, "excluded_companies.txt")
 DEFAULT_TEMPLATE = os.path.join(BASE_DIR, "templates", "sample.txt")
 DEFAULT_CONTACTS = os.path.join(BASE_DIR, "contacts.csv")
+DEFAULT_TRACKING = default_tracking_path()
 MAX_PER_COMPANY = 15
 LIMIT_WINDOW_DAYS = 3
 
@@ -46,14 +65,21 @@ def load_contacts(path):
         if "First Name" in row:
             # Take only the first email if multiple are semicolon-separated
             raw_email = row.get("Email", "").strip()
-            email = raw_email.split(";")[0].strip()
+            email = normalize_email(raw_email.split(";")[0].strip())
             normalized.append({
                 "name": row["First Name"],
                 "company_name": row.get("Company", ""),
                 "email": email,
+                "title": row.get("Title", ""),
+                "linkedin_url": row.get("LinkedIn URL", row.get("linkedin_url", "")),
+                "source_status": row.get("Status", ""),
             })
         else:
-            normalized.append(row)
+            normalized.append({
+                **row,
+                "email": normalize_email(row.get("email", "")),
+                "linkedin_url": row.get("linkedin_url", row.get("linkedinUrl", "")),
+            })
     return normalized
 
 
@@ -83,42 +109,81 @@ def load_excluded_companies():
         }
 
 
-def get_recent_company_counts():
+def get_recent_company_counts(tracking_rows):
     """Count how many emails were sent to each company in the last LIMIT_WINDOW_DAYS days."""
     counts = collections.Counter()
-    if not os.path.exists(TRACKING_FILE):
-        return counts
     cutoff = datetime.now(timezone.utc).timestamp() - (LIMIT_WINDOW_DAYS * 86400)
-    with open(TRACKING_FILE, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            if row["status"] != "sent":
-                continue
-            try:
-                sent_ts = datetime.fromisoformat(row["sent_at"]).timestamp()
-            except ValueError:
-                continue
-            if sent_ts >= cutoff:
-                counts[row["company_name"].lower()] += 1
+    for row in tracking_rows:
+        if row.get("email_send_status") not in {"sent", "bounced"}:
+            continue
+        try:
+            sent_ts = datetime.fromisoformat(row["email_sent_at"]).timestamp()
+        except (ValueError, TypeError):
+            continue
+        if sent_ts >= cutoff:
+            counts[row.get("Company", "").lower()] += 1
     return counts
 
 
-def already_sent(email_addr):
-    if not os.path.exists(TRACKING_FILE):
-        return False
-    with open(TRACKING_FILE, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            if row["email"].lower() == email_addr.lower() and row["status"] == "sent":
+def already_sent(contact, tracking_rows):
+    target_email = normalize_email(contact.get("email", ""))
+    target_linkedin = contact.get("linkedin_url", "").strip()
+
+    for row in tracking_rows:
+        if target_linkedin and row.get("linkedinUrl", "").strip() == target_linkedin:
+            if row.get("email_send_status") in {"sent", "bounced"}:
                 return True
+
+        if target_email and normalize_email(row.get("email", "")) == target_email:
+            if row.get("email_send_status") in {"sent", "bounced"}:
+                return True
+
     return False
 
 
-def append_tracking(row_dict):
-    file_exists = os.path.exists(TRACKING_FILE)
-    with open(TRACKING_FILE, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=TRACKING_HEADERS)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(row_dict)
+def update_tracking_after_attempt(
+    tracking_rows,
+    contact,
+    *,
+    status,
+    sender_account,
+    error_message="",
+    sent_at="",
+):
+    timestamp = sent_at or now_iso()
+    updates = {
+        "linkedinUrl": contact.get("linkedin_url", "").strip(),
+        "Name": contact.get("name", "").strip(),
+        "Title": contact.get("title", "").strip(),
+        "Company": contact.get("company_name", "").strip(),
+        "email": normalize_email(contact.get("email", "")),
+        "all_emails": normalize_email(contact.get("email", "")),
+        "kaspr_status": contact.get("source_status", "").strip(),
+        "email_send_status": status,
+        "email_last_attempt_at": timestamp,
+        "email_sender_account": sender_account,
+        "source_stage": "email",
+    }
+
+    if status == "sent":
+        updates.update({
+            "email_sent_at": timestamp,
+            "email_last_error": "",
+            "read_receipt": "False",
+            "reply_detected": "False",
+            "reply_at": "",
+        })
+    else:
+        updates.update({
+            "email_last_error": error_message.strip(),
+        })
+
+    return upsert_tracking_row(
+        tracking_rows,
+        updates,
+        linkedin_url=contact.get("linkedin_url", "").strip(),
+        email=contact.get("email", ""),
+    )
 
 
 def render(template_str, contact):
@@ -236,6 +301,10 @@ def main():
         help="Path to contacts CSV file",
     )
     parser.add_argument(
+        "--tracking", default=DEFAULT_TRACKING,
+        help="Path to master tracking CSV file",
+    )
+    parser.add_argument(
         "--attach", nargs="*", default=[],
         help="File(s) to attach (e.g. --attach resume.pdf)",
     )
@@ -263,6 +332,7 @@ def main():
 
     sender_states = build_sender_states(args.sender)
     contacts = load_contacts(args.contacts)
+    tracking_rows = load_tracking(args.tracking)
     subject_tpl, body_tpl = load_template(args.template)
     auth_method_names = []
     for state in sender_states:
@@ -272,7 +342,7 @@ def main():
             )
         )
     excluded = load_excluded_companies()
-    company_counts = get_recent_company_counts()
+    company_counts = get_recent_company_counts(tracking_rows)
 
     if not contacts:
         print("No contacts found.")
@@ -305,7 +375,7 @@ def main():
             if company_counts[company_key] >= MAX_PER_COMPANY:
                 print(f"\nSKIP (limit {MAX_PER_COMPANY}/{LIMIT_WINDOW_DAYS}d): {contact['email']} [{contact['company_name']}]")
                 continue
-            if already_sent(contact["email"]):
+            if already_sent(contact, tracking_rows):
                 print(f"\nSKIP (already sent): {contact['email']}")
                 continue
             sender_state = sender_states[sender_index % len(sender_states)]
@@ -363,7 +433,7 @@ def main():
                 limited += 1
                 continue
 
-            if already_sent(email_addr):
+            if already_sent(contact, tracking_rows):
                 print(f"SKIP (already sent): {email_addr}")
                 skipped += 1
                 continue
@@ -383,17 +453,14 @@ def main():
                 else:
                     send_email_smtp(sender_state["server"], provider["address"], email_addr, subj, body, args.attach)
 
-                append_tracking({
-                    "email": email_addr,
-                    "name": contact["name"],
-                    "company_name": contact["company_name"],
-                    "sent_at": datetime.now(timezone.utc).isoformat(),
-                    "sender_account": provider["address"],
-                    "status": "sent",
-                    "read_receipt": "False",
-                    "reply_detected": "False",
-                    "reply_at": "",
-                })
+                update_tracking_after_attempt(
+                    tracking_rows,
+                    contact,
+                    status="sent",
+                    sender_account=provider["address"],
+                    sent_at=now_iso(),
+                )
+                save_tracking(tracking_rows, args.tracking)
                 company_counts[company_key] += 1
                 print(f"SENT: {email_addr} [{contact['company_name']}] via {provider['address']}")
                 sent += 1
@@ -410,17 +477,15 @@ def main():
                     time.sleep(delay)
             except Exception as e:
                 print(f"FAILED: {email_addr} — {e}")
-                append_tracking({
-                    "email": email_addr,
-                    "name": contact["name"],
-                    "company_name": contact["company_name"],
-                    "sent_at": datetime.now(timezone.utc).isoformat(),
-                    "sender_account": provider["address"],
-                    "status": f"failed: {e}",
-                    "read_receipt": "False",
-                    "reply_detected": "False",
-                    "reply_at": "",
-                })
+                update_tracking_after_attempt(
+                    tracking_rows,
+                    contact,
+                    status="failed",
+                    sender_account=provider["address"],
+                    error_message=str(e),
+                    sent_at=now_iso(),
+                )
+                save_tracking(tracking_rows, args.tracking)
                 failed += 1
     except StopIteration:
         pass

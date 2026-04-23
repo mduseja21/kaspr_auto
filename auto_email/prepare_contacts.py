@@ -1,26 +1,22 @@
 #!/usr/bin/env python3
-"""Convert scraper results into the contact shape used by auto_email."""
+"""Build sender contacts from the unified master tracking CSV."""
 
 import argparse
 import csv
 from pathlib import Path
 
+try:
+    from .master_tracking import default_tracking_path, load_tracking, normalize_email
+except ImportError:
+    from master_tracking import default_tracking_path, load_tracking, normalize_email
 
-DEFAULT_INPUT = "results.csv"
+DEFAULT_INPUT = default_tracking_path()
 DEFAULT_OUTPUT = "auto_email/contacts_from_scrape.csv"
 OUTPUT_HEADERS = ["name", "company_name", "email", "title", "linkedin_url", "source_status"]
 
 
-def normalize_email(raw_email):
-    email = (raw_email or "").strip().lower()
-    if not email or "@" not in email:
-        return ""
-    return email
-
-
-def load_scrape_rows(path):
-    with open(path, newline="", encoding="utf-8") as handle:
-        return list(csv.DictReader(handle))
+def load_tracking_rows(path):
+    return load_tracking(str(path))
 
 
 def build_contacts(rows):
@@ -28,6 +24,10 @@ def build_contacts(rows):
     contacts = []
 
     for row in rows:
+        kaspr_status = row.get("kaspr_status", row.get("status", "")).strip().lower()
+        if kaspr_status != "found":
+            continue
+
         email = normalize_email(row.get("email"))
         if not email:
             continue
@@ -42,7 +42,7 @@ def build_contacts(rows):
                 "email": email,
                 "title": row.get("Title", "").strip(),
                 "linkedin_url": row.get("linkedinUrl", row.get("linkedin_url", "")).strip(),
-                "source_status": row.get("status", "").strip(),
+                "source_status": row.get("kaspr_status", row.get("status", "")).strip(),
             }
         )
 
@@ -61,12 +61,12 @@ def write_contacts(path, contacts):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert Kaspr scraper results into auto_email contacts."
+        description="Convert master tracking rows into auto_email contacts."
     )
     parser.add_argument(
         "--input",
         default=DEFAULT_INPUT,
-        help=f"Path to scraper results CSV (default: {DEFAULT_INPUT})",
+        help=f"Path to master tracking CSV (default: {DEFAULT_INPUT})",
     )
     parser.add_argument(
         "--output",
@@ -75,11 +75,11 @@ def main():
     )
     args = parser.parse_args()
 
-    rows = load_scrape_rows(args.input)
+    rows = load_tracking_rows(args.input)
     contacts = build_contacts(rows)
     write_contacts(args.output, contacts)
 
-    print(f"Read {len(rows)} scrape rows from {args.input}")
+    print(f"Read {len(rows)} master tracking rows from {args.input}")
     print(f"Wrote {len(contacts)} contacts to {args.output}")
 
 

@@ -7,9 +7,20 @@ const fs = require("fs");
 const path = require("path");
 const {
   buildApolloBatchFromCombinedUrl,
+  prepareApolloFirmInput,
   runApolloScrape,
   writeApolloInputCsv,
 } = require("./apollo_camoufox");
+const {
+  hasCompletedKasprScrape,
+  loadOrCreateTrackingState,
+  mergeMasterTrackingRows,
+  normalizeCell,
+  normalizeLinkedInUrl,
+  readCsvRows,
+  upsertTrackingRows,
+  writeTrackingStateArtifacts,
+} = require("./tracking_state");
 
 puppeteer.use(StealthPlugin());
 
@@ -60,7 +71,7 @@ const CONFIG = {
 
   userDataDir:
     process.env.CHROME_USER_DATA_DIR ||
-    path.join(process.env.HOME, "Library/Application Support/Google/Chrome"),
+    path.join(process.cwd(), "runtime", "chrome_profile"),
 
   inputCsv: process.env.INPUT_CSV || "linkedin_urls.csv",
   urlColumn: process.env.URL_COLUMN || "linkedinUrl",
@@ -106,6 +117,12 @@ const CONFIG = {
         path.join(process.cwd(), "auto_email", "contacts_from_scrape.csv")
     )
   ),
+  autoEmailTrackingCsv: path.resolve(
+    expandHome(
+      process.env.AUTO_EMAIL_TRACKING_CSV ||
+        path.join(process.cwd(), "auto_email", "tracking.csv")
+    )
+  ),
   autoEmailResultsCsv: path.resolve(
     expandHome(
       process.env.AUTO_EMAIL_RESULTS_CSV ||
@@ -125,11 +142,20 @@ const CONFIG = {
       process.env.APOLLO_INPUT_CSV || path.join(process.cwd(), "runtime", "apollo", "apollo_input.csv")
     )
   ),
+  apolloFirmInputCsv: process.env.APOLLO_FIRM_INPUT_CSV
+    ? path.resolve(expandHome(process.env.APOLLO_FIRM_INPUT_CSV))
+    : "",
   apolloCombinedUrl: process.env.APOLLO_COMBINED_URL || "",
   apolloGeneratedInputCsv: path.resolve(
     expandHome(
       process.env.APOLLO_GENERATED_INPUT_CSV ||
         path.join(process.cwd(), "runtime", "apollo", "generated_input.csv")
+    )
+  ),
+  apolloOrgMatchReportCsv: path.resolve(
+    expandHome(
+      process.env.APOLLO_ORG_MATCH_REPORT_CSV ||
+        path.join(process.cwd(), "runtime", "apollo", "org_match_report.csv")
     )
   ),
   apolloProfileDir: path.resolve(
@@ -140,6 +166,10 @@ const CONFIG = {
   apolloFirefoxProfileDir: expandHome(process.env.APOLLO_FIREFOX_PROFILE_DIR || ""),
   apolloHeadless: parseBooleanEnv(process.env.APOLLO_HEADLESS, false),
   apolloHumanize: parseHumanizeEnv(process.env.APOLLO_HUMANIZE, true),
+  apolloForceRefreshOrgMatches: parseBooleanEnv(
+    process.env.APOLLO_FORCE_REFRESH_ORG_MATCHES,
+    false
+  ),
   apolloMaxPagesPerOrg: parseInt(process.env.APOLLO_MAX_PAGES_PER_ORG || "5", 10),
   apolloSettleMs: parseInt(process.env.APOLLO_SETTLE_MS || "3000", 10),
   apolloActionMinWaitMs: parseInt(process.env.APOLLO_ACTION_MIN_WAIT_MS || "1500", 10),
@@ -354,100 +384,109 @@ function randomDelay() {
 }
 
 function readInputCsv(filePath = CONFIG.inputCsv) {
-  let raw = fs.readFileSync(filePath, "utf-8");
-  if (raw.charCodeAt(0) === 0xFEFF) raw = raw.slice(1); // strip BOM
-  const records = parse(raw, { columns: true, skip_empty_lines: true, trim: true });
-  const rows = records.filter((r) => {
-    if (!r[CONFIG.urlColumn] || !r[CONFIG.urlColumn].includes("linkedin.com/in/")) return false;
-    if (!r.Name || r.Name.trim().length < 2) return false;
-    if (!r.Company || r.Company.trim().length < 2) return false;
-    return true;
-  });
+  const rows = readCsvRows(filePath)
+    .map((row) => {
+      const linkedinUrl = normalizeLinkedInUrl(
+        row[CONFIG.urlColumn] || row.linkedinUrl || row.linkedin_url || ""
+      );
+      if (!linkedinUrl) return null;
+
+      return {
+        ...row,
+        [CONFIG.urlColumn]: linkedinUrl,
+        linkedinUrl,
+        Name: normalizeCell(row.Name || row.name || ""),
+        Title: normalizeCell(row.Title || row.title || ""),
+        Company: normalizeCell(row.Company || row.company_name || row.company || ""),
+      };
+    })
+    .filter(Boolean);
   console.log(`Found ${rows.length} LinkedIn URLs in ${filePath}`);
   return rows;
 }
 
-function loadExistingResults(filePath = CONFIG.outputCsv) {
-  return loadResultsFrom(filePath);
+function getTrackingSeedPaths(scrapeOutputCsv = CONFIG.outputCsv) {
+  return [...new Set([
+    CONFIG.outputCsv,
+    scrapeOutputCsv,
+    CONFIG.autoEmailResultsCsv,
+    CONFIG.apolloCanonicalOutputCsv,
+  ].map((value) => path.resolve(value)))];
 }
 
-function loadResultsFrom(filePath) {
-  if (!fs.existsSync(filePath)) return {};
-  const raw = fs.readFileSync(filePath, "utf-8");
-  const records = parse(raw, { columns: true, skip_empty_lines: true });
-  const map = {};
-  for (const r of records) {
-    const url = r[CONFIG.urlColumn] || r.linkedinUrl || r.linkedin_url;
-    if (url) map[url] = r;
-  }
-  return map;
-}
+function loadTrackingState(scrapeOutputCsv = CONFIG.outputCsv, seedRows = []) {
+  const state = loadOrCreateTrackingState({
+    trackingPath: CONFIG.autoEmailTrackingCsv,
+    seedPaths: getTrackingSeedPaths(scrapeOutputCsv),
+    seedRows,
+  });
 
-function saveResult(results, filePath = CONFIG.outputCsv) {
-  saveResultsTo(filePath, results);
-  syncAutoEmailEligibility(results, { silent: true, sourcePath: filePath });
-}
-
-function saveResultsTo(filePath, results) {
-  const rows = Object.values(results);
-  if (rows.length === 0) return;
-  const csv = stringify(rows, { header: true });
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(filePath, csv);
-}
-
-function hasFoundEmail(record) {
-  return (record?.status || "").trim() === "found" && Boolean((record?.email || "").trim());
-}
-
-function getScrapedAtTime(record) {
-  const timestamp = Date.parse(record?.scraped_at || "");
-  return Number.isFinite(timestamp) ? timestamp : Number.NEGATIVE_INFINITY;
-}
-
-function choosePreferredResult(existingRecord, incomingRecord) {
-  if (!existingRecord) return incomingRecord;
-
-  const existingFound = hasFoundEmail(existingRecord);
-  const incomingFound = hasFoundEmail(incomingRecord);
-
-  if (incomingFound && !existingFound) return incomingRecord;
-  if (existingFound && !incomingFound) return existingRecord;
-
-  return getScrapedAtTime(incomingRecord) >= getScrapedAtTime(existingRecord)
-    ? incomingRecord
-    : existingRecord;
-}
-
-function mergeResultsMaps(existingResults, incomingResults) {
-  const merged = { ...existingResults };
-  for (const [url, record] of Object.entries(incomingResults)) {
-    merged[url] = choosePreferredResult(merged[url], record);
-  }
-  return merged;
-}
-
-function syncAutoEmailEligibility(
-  currentResults,
-  { silent = false, sourcePath = CONFIG.outputCsv } = {}
-) {
-  if (!currentResults || Object.keys(currentResults).length === 0) return;
-
-  const targetPath = path.resolve(CONFIG.autoEmailResultsCsv);
-  const resolvedSourcePath = path.resolve(sourcePath);
-  if (targetPath === resolvedSourcePath) return;
-
-  const existingEligibleResults = loadResultsFrom(targetPath);
-  const mergedEligibleResults = mergeResultsMaps(existingEligibleResults, currentResults);
-
-  saveResultsTo(targetPath, mergedEligibleResults);
-
-  if (!silent) {
-    const eligibleCount = Object.values(mergedEligibleResults).filter(hasFoundEmail).length;
+  if (state.migratedLegacy && state.migrationSummary) {
     console.log(
-      `Eligible email pool updated: ${eligibleCount} found emails in ${targetPath}`
+      `Master tracking migrated from legacy email-only schema. Backup: ${state.migrationSummary.backupPath}`
+    );
+    console.log(
+      `Legacy migration imported ${state.migrationSummary.importedCount} matched row(s); ${state.migrationSummary.unmatchedCount} unmatched row(s) stayed preserved in the backup.`
     );
   }
+
+  return state.trackingMap;
+}
+
+function saveTrackingArtifacts(trackingMap, {
+  scrapeOutputCsv = CONFIG.outputCsv,
+  currentRunUrls = null,
+  silent = false,
+} = {}) {
+  writeTrackingStateArtifacts({
+    trackingPath: CONFIG.autoEmailTrackingCsv,
+    trackingMap,
+    resultsExportPath: scrapeOutputCsv,
+    eligibleExportPath: CONFIG.autoEmailResultsCsv,
+    resultsFilterUrls: currentRunUrls,
+  });
+
+  if (!silent) {
+    const eligibleCount = Object.values(trackingMap).filter((row) => row.email).length;
+    console.log(
+      `Master tracking saved to ${CONFIG.autoEmailTrackingCsv} (${Object.keys(trackingMap).length} profile row(s)); ${eligibleCount} row(s) currently have an email.`
+    );
+  }
+}
+
+function seedTrackingRowsFromInputRows(trackingMap, rows, sourceStage) {
+  upsertTrackingRows(
+    trackingMap,
+    rows.map((row) => ({
+      linkedinUrl: row.linkedinUrl || row[CONFIG.urlColumn],
+      Name: row.Name,
+      Title: row.Title,
+      Company: row.Company,
+      source_stage: sourceStage,
+    })),
+    sourceStage
+  );
+
+  return trackingMap;
+}
+
+function buildKasprQueueRows(trackingMap) {
+  return Object.values(trackingMap)
+    .map((row) => {
+      const linkedinUrl = normalizeLinkedInUrl(row.linkedinUrl || row[CONFIG.urlColumn] || "");
+      if (!linkedinUrl) return null;
+
+      return {
+        ...row,
+        [CONFIG.urlColumn]: linkedinUrl,
+        linkedinUrl,
+        Name: normalizeCell(row.Name || row.name || ""),
+        Title: normalizeCell(row.Title || row.title || ""),
+        Company: normalizeCell(row.Company || row.company_name || row.company || ""),
+      };
+    })
+    .filter(Boolean)
+    .filter((row) => !hasCompletedKasprScrape(row));
 }
 
 function getEmailResultsPath() {
@@ -707,7 +746,54 @@ function getScrapeOutputCsvForMode(pipelineMode) {
   return path.resolve(CONFIG.outputCsv);
 }
 
-function resolveApolloInputCsv() {
+async function resolveApolloInputCsv() {
+  if (CONFIG.apolloFirmInputCsv) {
+    const result = await prepareApolloFirmInput({
+      firmInputCsv: CONFIG.apolloFirmInputCsv,
+      templateUrl: CONFIG.apolloCombinedUrl,
+      generatedInputCsv: CONFIG.apolloGeneratedInputCsv,
+      orgMatchReportCsv: CONFIG.apolloOrgMatchReportCsv,
+      profileDir: CONFIG.apolloProfileDir,
+      firefoxProfileDir: CONFIG.apolloFirefoxProfileDir || null,
+      headless: CONFIG.apolloHeadless,
+      humanize: CONFIG.apolloHumanize,
+      forceRefreshOrgMatches: CONFIG.apolloForceRefreshOrgMatches,
+      settleMs: CONFIG.apolloSettleMs,
+      actionMinWaitMs: CONFIG.apolloActionMinWaitMs,
+      actionMaxWaitMs: CONFIG.apolloActionMaxWaitMs,
+      pageTimeoutMs: CONFIG.apolloPageTimeoutMs,
+      maxPagesPerOrg: CONFIG.apolloMaxPagesPerOrg,
+    });
+
+    console.log("Apollo firm-name input detected. Using APOLLO_FIRM_INPUT_CSV precedence.");
+    console.log(`Apollo firm input rows: ${result.firmCount}`);
+    console.log(`Apollo unique firm names: ${result.uniqueFirmCount}`);
+    console.log(`Apollo resolved firms: ${result.resolvedFirmCount}`);
+    console.log(`Apollo unresolved firms: ${result.unresolvedFirmCount}`);
+    console.log(`Apollo cached firm matches loaded: ${result.loadedCacheCount}`);
+    console.log(`Apollo cache hits: ${result.cacheHitCount}`);
+    console.log(`Apollo cache misses: ${result.cacheMissCount}`);
+    console.log(`Apollo cache refreshes: ${result.refreshedCount}`);
+    console.log(`Apollo company lookups performed: ${result.apolloLookupCount}`);
+    console.log(`Apollo unique org ids: ${result.orgCount}`);
+    console.log(`Apollo page fanout per org: ${result.pageCount}`);
+    console.log(`Apollo generated URLs: ${result.urlCount}`);
+    console.log(`Apollo org match report: ${result.orgMatchReportCsv}`);
+    console.log(`Apollo generated input CSV: ${result.generatedInputCsv}`);
+
+    return {
+      inputCsv: result.generatedInputCsv,
+      generated: true,
+      firmCount: result.firmCount,
+      resolvedFirmCount: result.resolvedFirmCount,
+      unresolvedFirmCount: result.unresolvedFirmCount,
+      orgCount: result.orgCount,
+      pageCount: result.pageCount,
+      urlCount: result.urlCount,
+      orgMatchReportCsv: result.orgMatchReportCsv,
+    };
+  }
+
   if (!CONFIG.apolloCombinedUrl) {
     return {
       inputCsv: CONFIG.apolloInputCsv,
@@ -738,7 +824,7 @@ function resolveApolloInputCsv() {
 
 async function runApolloStage() {
   console.log("Starting Apollo Camoufox stage...");
-  const inputConfig = resolveApolloInputCsv();
+  const inputConfig = await resolveApolloInputCsv();
   const result = await runApolloScrape({
     inputCsv: inputConfig.inputCsv,
     profileDir: CONFIG.apolloProfileDir,
@@ -769,13 +855,17 @@ function runAutoEmailFollowUp(resultsPath = getEmailResultsPath()) {
 
   const command = [
     helperPath,
-    "--results",
-    path.resolve(resultsPath),
+    "--tracking",
+    CONFIG.autoEmailTrackingCsv,
     "--contacts-out",
     CONFIG.autoEmailContactsCsv,
     "--template",
     CONFIG.autoEmailTemplate,
   ];
+
+  if (resultsPath) {
+    command.push("--results", path.resolve(resultsPath));
+  }
 
   if (CONFIG.autoEmailSourceTracking) {
     command.push(
@@ -822,28 +912,112 @@ async function main() {
 
   console.log(`Pipeline mode: ${CONFIG.pipelineMode}`);
 
+  let scrapeInputCsv = path.resolve(CONFIG.inputCsv);
+  const scrapeOutputCsv = getScrapeOutputCsvForMode(CONFIG.pipelineMode);
+  let trackingMap = loadTrackingState(scrapeOutputCsv);
+
   if (CONFIG.pipelineMode === "email") {
     const emailResultsPath = getEmailResultsPath();
-    if (!fs.existsSync(emailResultsPath)) {
-      console.error(`ERROR: Results CSV not found for email mode: ${emailResultsPath}`);
+    if (!fs.existsSync(CONFIG.autoEmailTrackingCsv) && !fs.existsSync(emailResultsPath)) {
+      console.error(
+        `ERROR: Neither master tracking (${CONFIG.autoEmailTrackingCsv}) nor a compatibility results CSV (${emailResultsPath}) exists for email mode.`
+      );
       process.exit(1);
     }
+
+    if (Object.keys(trackingMap).length === 0 && fs.existsSync(emailResultsPath)) {
+      trackingMap = loadTrackingState(scrapeOutputCsv, readCsvRows(emailResultsPath));
+    }
+
+    if (Object.keys(trackingMap).length === 0) {
+      console.error(`ERROR: Master tracking is empty at ${CONFIG.autoEmailTrackingCsv}.`);
+      process.exit(1);
+    }
+
+    saveTrackingArtifacts(trackingMap, {
+      scrapeOutputCsv: fs.existsSync(emailResultsPath) ? emailResultsPath : scrapeOutputCsv,
+      silent: true,
+    });
     runAutoEmailFollowUp(emailResultsPath);
     return;
   }
 
-  let scrapeInputCsv = path.resolve(CONFIG.inputCsv);
-  const scrapeOutputCsv = getScrapeOutputCsvForMode(CONFIG.pipelineMode);
-
   if (["apollo-only", "apollo-full"].includes(CONFIG.pipelineMode)) {
     const apolloResult = await runApolloStage();
     scrapeInputCsv = apolloResult.canonicalOutputCsv;
+    upsertTrackingRows(trackingMap, apolloResult.canonicalRows || readCsvRows(apolloResult.canonicalOutputCsv), "apollo");
+    saveTrackingArtifacts(trackingMap, {
+      scrapeOutputCsv,
+      silent: true,
+    });
 
     if (CONFIG.pipelineMode === "apollo-only") {
       console.log("\nApollo-only mode complete. Skipping Kaspr and auto_email stages.");
       return;
     }
   }
+
+  let seededInputRows = 0;
+  if (fs.existsSync(scrapeInputCsv)) {
+    const inputRows = readInputCsv(scrapeInputCsv);
+    if (inputRows.length > 0) {
+      seedTrackingRowsFromInputRows(
+        trackingMap,
+        inputRows,
+        ["apollo-only", "apollo-full"].includes(CONFIG.pipelineMode) ? "apollo" : "manual_input"
+      );
+      seededInputRows = inputRows.length;
+      console.log(
+        `Seeded ${inputRows.length} LinkedIn profile row(s) into master tracking from ${scrapeInputCsv}.`
+      );
+    } else {
+      console.log(
+        `Input CSV ${scrapeInputCsv} did not contain any valid LinkedIn profile rows. Continuing with master tracking only.`
+      );
+    }
+  } else {
+    console.log(
+      `Input CSV not found at ${scrapeInputCsv}. Continuing with master tracking only.`
+    );
+  }
+
+  saveTrackingArtifacts(trackingMap, {
+    scrapeOutputCsv,
+    silent: true,
+  });
+
+  const urlsToProcess = buildKasprQueueRows(trackingMap);
+  const trackedCount = Object.keys(trackingMap).length;
+  const completedCount = trackedCount - urlsToProcess.length;
+  console.log(
+    `${urlsToProcess.length} pending LinkedIn profile(s) queued in master tracking (${completedCount} already completed, ${trackedCount} total tracked).`
+  );
+
+  if (urlsToProcess.length === 0) {
+    if (trackedCount === 0) {
+      console.error(
+        "No LinkedIn profiles are available to process. Add rows via Apollo/manual input first so they land in master tracking."
+      );
+      process.exit(1);
+    }
+
+    console.log("No pending Kaspr work remains in master tracking.");
+    saveTrackingArtifacts(trackingMap, {
+      scrapeOutputCsv,
+      silent: true,
+    });
+    if (["full", "apollo-full"].includes(CONFIG.pipelineMode)) {
+      runAutoEmailFollowUp(scrapeOutputCsv);
+    } else if (seededInputRows > 0) {
+      console.log("New rows were added to master tracking, but none currently need Kaspr scraping.");
+    }
+    return;
+  }
+
+  const batch = urlsToProcess.slice(0, CONFIG.maxProfiles);
+  console.log(
+    `Processing ${batch.length} queued profile(s) from master tracking in this run (max: ${CONFIG.maxProfiles})\n`
+  );
 
   if (!CONFIG.extensionPath) {
     console.error("ERROR: Could not find a usable Kaspr extension path.");
@@ -858,36 +1032,6 @@ async function main() {
   if (CONFIG.extensionSource) {
     console.log(`Extension source: ${CONFIG.extensionSource}`);
   }
-
-  if (!fs.existsSync(scrapeInputCsv)) {
-    console.error(`ERROR: Input CSV file not found: ${scrapeInputCsv}`);
-    process.exit(1);
-  }
-
-  const inputRows = readInputCsv(scrapeInputCsv);
-  if (inputRows.length === 0) {
-    console.error("No valid LinkedIn URLs found in the CSV.");
-    process.exit(1);
-  }
-
-  const existingResults = loadExistingResults(scrapeOutputCsv);
-  const urlsToProcess = inputRows.filter((r) => !existingResults[r[CONFIG.urlColumn]]);
-  console.log(
-    `${urlsToProcess.length} new URLs to process (${Object.keys(existingResults).length} already done)`
-  );
-
-  if (urlsToProcess.length === 0) {
-    console.log("All URLs already processed. Nothing to do.");
-    syncAutoEmailEligibility(existingResults, { sourcePath: scrapeOutputCsv });
-    if (["full", "apollo-full"].includes(CONFIG.pipelineMode)) {
-      console.log("Using eligible results for auto_email follow-up.");
-      runAutoEmailFollowUp(CONFIG.autoEmailResultsCsv);
-    }
-    return;
-  }
-
-  const batch = urlsToProcess.slice(0, CONFIG.maxProfiles);
-  console.log(`Processing ${batch.length} profiles in this run (max: ${CONFIG.maxProfiles})\n`);
 
   // Launch browser with Kaspr extension
   const browser = await puppeteer.launch({
@@ -941,15 +1085,22 @@ async function main() {
         );
 
         const bestEmail = pickBestEmail(emails, row.Company);
-        existingResults[url] = {
-          ...row,
+        trackingMap[url] = mergeMasterTrackingRows(trackingMap[url], {
+          linkedinUrl: url,
+          Name: row.Name,
+          Title: row.Title,
+          Company: row.Company,
           email: bestEmail,
           all_emails: emails.join("; "),
           phones: phones.join("; "),
-          status: emails.length > 0 ? "found" : "no_email",
-          scraped_at: new Date().toISOString(),
-        };
-        saveResult(existingResults, scrapeOutputCsv);
+          kaspr_status: emails.length > 0 ? "found" : "no_email",
+          kaspr_scraped_at: new Date().toISOString(),
+          source_stage: "kaspr",
+        });
+        saveTrackingArtifacts(trackingMap, {
+          scrapeOutputCsv,
+          silent: true,
+        });
         break;
       } catch (err) {
         const retryable = /Navigation timeout|ERR_ABORTED/.test(err.message || "");
@@ -963,15 +1114,19 @@ async function main() {
         }
 
         console.error(`  Error: ${err.message}`);
-        existingResults[url] = {
-          ...row,
-          email: "",
-          all_emails: "",
-          phones: "",
-          status: "error",
-          scraped_at: new Date().toISOString(),
-        };
-        saveResult(existingResults, scrapeOutputCsv);
+        trackingMap[url] = mergeMasterTrackingRows(trackingMap[url], {
+          linkedinUrl: url,
+          Name: row.Name,
+          Title: row.Title,
+          Company: row.Company,
+          kaspr_status: "error",
+          kaspr_scraped_at: new Date().toISOString(),
+          source_stage: "kaspr",
+        });
+        saveTrackingArtifacts(trackingMap, {
+          scrapeOutputCsv,
+          silent: true,
+        });
         break;
       }
     }
@@ -982,13 +1137,15 @@ async function main() {
     }
   }
 
-  console.log(`\nDone! Results saved to ${scrapeOutputCsv}`);
-  console.log(`Processed: ${processed}, Total in results: ${Object.keys(existingResults).length}`);
-  syncAutoEmailEligibility(existingResults, { sourcePath: scrapeOutputCsv });
+  console.log(`\nDone! Master tracking saved to ${CONFIG.autoEmailTrackingCsv}`);
+  console.log(`Processed: ${processed}, Total tracked profiles: ${Object.keys(trackingMap).length}`);
+  saveTrackingArtifacts(trackingMap, {
+    scrapeOutputCsv,
+  });
 
   await browser.close();
   if (["full", "apollo-full"].includes(CONFIG.pipelineMode)) {
-    runAutoEmailFollowUp(CONFIG.autoEmailResultsCsv);
+    runAutoEmailFollowUp(scrapeOutputCsv);
   } else {
     console.log("\nScrape-only mode complete. Skipping auto_email follow-up.");
   }

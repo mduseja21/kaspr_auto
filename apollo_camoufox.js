@@ -5,8 +5,19 @@ const { parse } = require("csv-parse/sync");
 const { stringify } = require("csv-stringify/sync");
 
 const RAW_COLUMNS = ["Name", "Title", "Company", "linkedinUrl"];
+const ORG_MATCH_REPORT_COLUMNS = [
+  "firmName",
+  "firmCacheKey",
+  "status",
+  "orgId",
+  "matchedCompanyName",
+  "matchReason",
+];
 const APOLLO_PAGE_PARAM = "page";
 const APOLLO_ORG_PARAM = "organizationIds[]";
+const APOLLO_BOOTSTRAP_URL = "https://app.apollo.io/#/people";
+const APOLLO_COMPANY_SEARCH_PATH = "/api/v1/mixed_companies/search";
+const APOLLO_COMPANY_LOOKUP_PER_PAGE = 5;
 const APOLLO_RESULT_SELECTORS = [
   '[role="row"] [data-testid="contact-name-cell"] a',
   '[role="gridcell"][aria-colindex="1"] [data-testid="contact-name-cell"] a',
@@ -32,6 +43,35 @@ const APOLLO_COOKIE_QUERY = `
   where host like '%apollo.io%'
   order by host, name
 `;
+const COMPANY_ENTITY_SUFFIX_TOKENS = new Set([
+  "ab",
+  "ag",
+  "aps",
+  "as",
+  "bv",
+  "co",
+  "company",
+  "corp",
+  "corporation",
+  "gmbh",
+  "inc",
+  "incorporated",
+  "kk",
+  "limited",
+  "llc",
+  "llp",
+  "lp",
+  "ltd",
+  "nv",
+  "oy",
+  "plc",
+  "pte",
+  "sa",
+  "sas",
+  "spa",
+  "srl",
+  "sro",
+]);
 
 function normalizeCell(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
@@ -42,7 +82,7 @@ function stripBom(raw) {
 }
 
 function isLikelyApolloSearchUrl(value) {
-  return /(?:app\.)?apollo\.io\/#\/people\?/i.test(String(value || "").trim());
+  return /(?:app\.)?apollo\.io\/#\/people(?:\?|$)/i.test(String(value || "").trim());
 }
 
 function isValidLinkedInProfileUrl(value) {
@@ -58,9 +98,10 @@ function normalizeLinkedInUrl(value) {
   if (!isValidLinkedInProfileUrl(value)) return "";
 
   const url = new URL(String(value).trim());
-  url.hash = "";
-  url.search = "";
-  return url.toString();
+  const match = url.pathname.match(/^\/in\/([^/?#]+)/i);
+  if (!match) return "";
+  const profileSlug = match[1];
+  return `https://www.linkedin.com/in/${profileSlug}/`;
 }
 
 function trimTrailingEmptyCells(cells) {
@@ -81,6 +122,20 @@ function isApolloOrgParam(key) {
 
 function ensureDirectory(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
+}
+
+function dedupeNormalizedValues(values) {
+  const deduped = [];
+  const seen = new Set();
+
+  for (const value of values) {
+    const normalized = normalizeCell(value);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    deduped.push(normalized);
+  }
+
+  return deduped;
 }
 
 function cleanupRawOutputDir(dirPath, prefix) {
@@ -198,14 +253,12 @@ function buildApolloUrlForOrgAndPage(parsedUrl, orgId, pageNumber) {
   return nextUrl.toString();
 }
 
-function buildApolloBatchFromCombinedUrl(combinedUrl, maxPagesPerOrg) {
-  const parsedUrl = parseApolloPeopleSearchUrl(combinedUrl);
-  const orgIds = extractApolloOrganizationIds(parsedUrl.orderedEntries);
-
+function buildApolloBatchFromOrganizationIds(templateUrl, organizationIds, maxPagesPerOrg) {
+  const parsedUrl = parseApolloPeopleSearchUrl(templateUrl);
+  const orgIds = dedupeNormalizedValues(organizationIds);
   if (orgIds.length === 0) {
-    throw new Error("Apollo combined URL did not contain any organizationIds[] values.");
+    throw new Error("Apollo org batch generation requires at least one organization id.");
   }
-
   const normalizedMaxPages = Number(maxPagesPerOrg);
   if (!Number.isInteger(normalizedMaxPages) || normalizedMaxPages <= 0) {
     throw new Error(
@@ -225,6 +278,17 @@ function buildApolloBatchFromCombinedUrl(combinedUrl, maxPagesPerOrg) {
     pageCount: normalizedMaxPages,
     urls,
   };
+}
+
+function buildApolloBatchFromCombinedUrl(combinedUrl, maxPagesPerOrg) {
+  const parsedUrl = parseApolloPeopleSearchUrl(combinedUrl);
+  const orgIds = extractApolloOrganizationIds(parsedUrl.orderedEntries);
+
+  if (orgIds.length === 0) {
+    throw new Error("Apollo combined URL did not contain any organizationIds[] values.");
+  }
+
+  return buildApolloBatchFromOrganizationIds(combinedUrl, orgIds, maxPagesPerOrg);
 }
 
 function readApolloInputCsv(filePath) {
@@ -248,10 +312,318 @@ function readApolloInputCsv(filePath) {
   return urls;
 }
 
+function readApolloFirmInputCsv(filePath) {
+  const raw = stripBom(fs.readFileSync(filePath, "utf-8"));
+  const records = parse(raw, {
+    columns: false,
+    skip_empty_lines: true,
+    trim: true,
+    relax_column_count: true,
+    relax_quotes: true,
+  });
+
+  const firms = [];
+  for (const record of records) {
+    const cells = Array.isArray(record) ? record : [record];
+    const firmName = cells.map(normalizeCell).find(Boolean);
+    if (!firmName) continue;
+    firms.push(firmName);
+  }
+
+  return firms;
+}
+
+function normalizeApolloFirmCacheKey(value) {
+  const normalizedCompanyName = normalizeApolloCompanyName(value);
+  if (normalizedCompanyName) return normalizedCompanyName;
+
+  return normalizeCell(value)
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/['’]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function buildApolloFirmLookupEntries(firms) {
+  const entries = new Map();
+
+  for (const firmName of firms) {
+    const normalizedFirmName = normalizeCell(firmName);
+    if (!normalizedFirmName) continue;
+
+    const firmCacheKey = normalizeApolloFirmCacheKey(normalizedFirmName);
+    if (!firmCacheKey) continue;
+
+    if (entries.has(firmCacheKey)) {
+      const existing = entries.get(firmCacheKey);
+      existing.firmName = normalizedFirmName;
+      existing.inputCount += 1;
+      continue;
+    }
+
+    entries.set(firmCacheKey, {
+      firmName: normalizedFirmName,
+      firmCacheKey,
+      inputCount: 1,
+    });
+  }
+
+  return [...entries.values()];
+}
+
+function normalizeApolloOrgMatchRow(row) {
+  const firmName = normalizeCell(row?.firmName || "");
+  const firmCacheKey = normalizeApolloFirmCacheKey(
+    row?.firmCacheKey || firmName || row?.matchedCompanyName || ""
+  );
+  if (!firmCacheKey) return null;
+
+  return {
+    firmName: firmName || firmCacheKey,
+    firmCacheKey,
+    status: normalizeCell(row?.status || "").toLowerCase() === "resolved" ? "resolved" : "unresolved",
+    orgId: normalizeCell(row?.orgId || ""),
+    matchedCompanyName: normalizeCell(row?.matchedCompanyName || ""),
+    matchReason: normalizeCell(row?.matchReason || ""),
+  };
+}
+
+function readApolloOrgMatchReport(filePath) {
+  const cache = new Map();
+  if (!filePath || !fs.existsSync(filePath)) {
+    return cache;
+  }
+
+  const raw = stripBom(fs.readFileSync(filePath, "utf-8"));
+  if (!normalizeCell(raw)) {
+    return cache;
+  }
+
+  const records = parse(raw, {
+    columns: true,
+    skip_empty_lines: true,
+    trim: true,
+    relax_column_count: true,
+    relax_quotes: true,
+  });
+
+  for (const record of records) {
+    const normalizedRow = normalizeApolloOrgMatchRow(record);
+    if (!normalizedRow) continue;
+    cache.set(normalizedRow.firmCacheKey, normalizedRow);
+  }
+
+  return cache;
+}
+
+function upsertApolloOrgMatchCache(cache, row) {
+  const normalizedRow = normalizeApolloOrgMatchRow(row);
+  if (!normalizedRow) return null;
+  cache.set(normalizedRow.firmCacheKey, normalizedRow);
+  return normalizedRow;
+}
+
 function writeApolloInputCsv(filePath, urls) {
   ensureDirectory(path.dirname(filePath));
   const csv = urls.length > 0 ? stringify(urls.map((url) => [url]), { header: false }) : "";
   fs.writeFileSync(filePath, csv);
+}
+
+function writeApolloOrgMatchReport(filePath, rows) {
+  ensureDirectory(path.dirname(filePath));
+  const normalizedRows = rows
+    .map((row) => normalizeApolloOrgMatchRow(row))
+    .filter(Boolean);
+  const csv = stringify(normalizedRows, {
+    header: true,
+    columns: ORG_MATCH_REPORT_COLUMNS,
+  });
+  fs.writeFileSync(filePath, csv);
+}
+
+function tokenizeApolloCompanyName(value) {
+  const normalized = normalizeCell(value)
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/['’]/g, "")
+    .replace(/[^a-z0-9]+/g, " ");
+
+  const tokens = normalized.split(/\s+/).filter(Boolean);
+
+  if (tokens[0] === "the" && tokens.length > 1) {
+    tokens.shift();
+  }
+
+  while (tokens.length > 1 && COMPANY_ENTITY_SUFFIX_TOKENS.has(tokens[tokens.length - 1])) {
+    tokens.pop();
+  }
+
+  return tokens;
+}
+
+function normalizeApolloCompanyName(value) {
+  return tokenizeApolloCompanyName(value).join(" ");
+}
+
+function sharedTokenPrefixLength(leftTokens, rightTokens) {
+  const limit = Math.min(leftTokens.length, rightTokens.length);
+  let index = 0;
+  while (index < limit && leftTokens[index] === rightTokens[index]) {
+    index += 1;
+  }
+  return index;
+}
+
+function scoreApolloOrganizationCandidate(firmName, candidateName) {
+  const firmTokens = tokenizeApolloCompanyName(firmName);
+  const candidateTokens = tokenizeApolloCompanyName(candidateName);
+  const firmNormalized = firmTokens.join(" ");
+  const candidateNormalized = candidateTokens.join(" ");
+
+  if (!firmNormalized || !candidateNormalized) {
+    return {
+      score: 0,
+      reason: "missing_normalized_name",
+    };
+  }
+
+  if (firmNormalized === candidateNormalized) {
+    return {
+      score: 100,
+      reason: "exact_normalized_name_match",
+    };
+  }
+
+  if (firmNormalized.replace(/\s+/g, "") === candidateNormalized.replace(/\s+/g, "")) {
+    return {
+      score: 95,
+      reason: "punctuation_variant_name_match",
+    };
+  }
+
+  const prefixLength = sharedTokenPrefixLength(firmTokens, candidateTokens);
+  const shorterLength = Math.min(firmTokens.length, candidateTokens.length);
+  const longerLength = Math.max(firmTokens.length, candidateTokens.length);
+  if (
+    shorterLength >= 2 &&
+    longerLength === shorterLength + 1 &&
+    prefixLength === shorterLength
+  ) {
+    return {
+      score: 85,
+      reason: "near_exact_prefix_name_match",
+    };
+  }
+
+  const extraCandidateTokens = candidateTokens.length - firmTokens.length;
+  if (
+    firmTokens.length >= 1 &&
+    prefixLength === firmTokens.length &&
+    extraCandidateTokens >= 1 &&
+    extraCandidateTokens <= 3
+  ) {
+    return {
+      score: 65 - Math.max(0, extraCandidateTokens - 1) * 5,
+      reason: "relaxed_prefix_name_match",
+    };
+  }
+
+  return {
+    score: 0,
+    reason: "no_exactish_name_match",
+  };
+}
+
+function selectApolloOrganizationMatch(firmName, candidates) {
+  const normalizedFirmName = normalizeApolloCompanyName(firmName);
+  if (!normalizedFirmName) {
+    return {
+      firmName,
+      status: "unresolved",
+      orgId: "",
+      matchedCompanyName: "",
+      matchReason: "empty_firm_name",
+    };
+  }
+
+  const validCandidates = candidates.filter((candidate) => candidate.orgId && candidate.name);
+  if (validCandidates.length === 0) {
+    return {
+      firmName,
+      status: "unresolved",
+      orgId: "",
+      matchedCompanyName: "",
+      matchReason: "no_candidates_returned",
+    };
+  }
+
+  const scoredCandidates = validCandidates
+    .map((candidate) => {
+      const score = scoreApolloOrganizationCandidate(firmName, candidate.name);
+      return {
+        ...score,
+        candidate,
+      };
+    })
+    .filter((candidate) => candidate.score > 0)
+    .sort((left, right) => {
+      if (right.score !== left.score) return right.score - left.score;
+      return left.candidate.name.localeCompare(right.candidate.name);
+    });
+
+  if (scoredCandidates.length === 0) {
+    return {
+      firmName,
+      status: "unresolved",
+      orgId: "",
+      matchedCompanyName: "",
+      matchReason: "no_exactish_company_name_match",
+    };
+  }
+
+  const topCandidate = scoredCandidates[0];
+  if (
+    topCandidate.reason === "relaxed_prefix_name_match" &&
+    scoredCandidates.length > 1
+  ) {
+    const relaxedCandidates = scoredCandidates
+      .filter((candidate) => candidate.reason === "relaxed_prefix_name_match")
+      .slice(0, 3)
+      .map((candidate) => candidate.candidate.name)
+      .join(" | ");
+    return {
+      firmName,
+      status: "unresolved",
+      orgId: "",
+      matchedCompanyName: "",
+      matchReason: `ambiguous_relaxed_prefix_name_match: ${relaxedCandidates}`,
+    };
+  }
+
+  const tiedCandidates = scoredCandidates.filter((candidate) => candidate.score === topCandidate.score);
+
+  if (tiedCandidates.length > 1) {
+    const ambiguousNames = tiedCandidates
+      .slice(0, 3)
+      .map((candidate) => candidate.candidate.name)
+      .join(" | ");
+    return {
+      firmName,
+      status: "unresolved",
+      orgId: "",
+      matchedCompanyName: "",
+      matchReason: `ambiguous_${topCandidate.reason}: ${ambiguousNames}`,
+    };
+  }
+
+  return {
+    firmName,
+    status: "resolved",
+    orgId: topCandidate.candidate.orgId,
+    matchedCompanyName: topCandidate.candidate.name,
+    matchReason: topCandidate.reason,
+  };
 }
 
 function normalizeCookieExpiry(value) {
@@ -366,6 +738,33 @@ async function assertApolloSessionReady(page) {
   return diagnostics;
 }
 
+async function openApolloPage(config, bootstrapUrl = APOLLO_BOOTSTRAP_URL) {
+  ensureDirectory(config.profileDir);
+
+  const context = await launchApolloContext(config);
+  try {
+    await importApolloFirefoxCookies(context, config);
+    const page = context.pages()[0] || (await context.newPage());
+
+    if (bootstrapUrl) {
+      await page.goto(bootstrapUrl, {
+        waitUntil: "domcontentloaded",
+        timeout: config.pageTimeoutMs,
+      });
+      await waitRandomActionDelay(page, config, "after Apollo bootstrap navigation");
+      await assertApolloSessionReady(page);
+    }
+
+    return {
+      context,
+      page,
+    };
+  } catch (error) {
+    await context.close();
+    throw error;
+  }
+}
+
 async function waitForApolloResults(page, timeout) {
   try {
     await page.waitForFunction(
@@ -440,6 +839,244 @@ async function fetchApolloPersonPayload(page, personId) {
     }
     return response.json();
   }, { personId, cacheKey: Date.now() });
+}
+
+async function fetchApolloCompanySearchPayload(page, firmName, perPage = APOLLO_COMPANY_LOOKUP_PER_PAGE) {
+  return page.evaluate(async ({ path, firmName, perPage, cacheKey }) => {
+    const response = await fetch(path, {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        q_organization_name: firmName,
+        page: 1,
+        per_page: perPage,
+        cacheKey,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Apollo company lookup failed for "${firmName}": ${response.status}`);
+    }
+
+    return response.json();
+  }, {
+    path: APOLLO_COMPANY_SEARCH_PATH,
+    firmName,
+    perPage,
+    cacheKey: Date.now(),
+  });
+}
+
+function extractApolloCompanyCandidates(payload) {
+  const rawCandidates = Array.isArray(payload?.organizations)
+    ? payload.organizations
+    : Array.isArray(payload?.accounts)
+      ? payload.accounts
+      : [];
+
+  const deduped = new Map();
+  for (const candidate of rawCandidates) {
+    const orgId = normalizeCell(
+      candidate?.id || candidate?.organization_id || candidate?.organization?.id || ""
+    );
+    const name = normalizeCell(
+      candidate?.name || candidate?.organization_name || candidate?.organization?.name || ""
+    );
+    if (!orgId || !name || deduped.has(orgId)) continue;
+
+    deduped.set(orgId, {
+      orgId,
+      name,
+    });
+  }
+
+  return [...deduped.values()];
+}
+
+async function prepareApolloFirmInput(config) {
+  const reportRows = [];
+  let context = null;
+  let firms = [];
+  let uniqueFirmEntries = [];
+  let orgMatchCache = new Map();
+  let cacheHitCount = 0;
+  let cacheMissCount = 0;
+  let refreshedCount = 0;
+  let apolloLookupCount = 0;
+  let loadedCacheCount = 0;
+
+  try {
+    orgMatchCache = readApolloOrgMatchReport(config.orgMatchReportCsv);
+    loadedCacheCount = orgMatchCache.size;
+
+    if (!config.firmInputCsv) {
+      throw new Error("Apollo firm lookup requires a firm input CSV path.");
+    }
+    if (!config.templateUrl) {
+      throw new Error(
+        "APOLLO_FIRM_INPUT_CSV requires APOLLO_COMBINED_URL as the Apollo people-search template URL."
+      );
+    }
+    if (!fs.existsSync(config.firmInputCsv)) {
+      throw new Error(`Apollo firm input CSV file not found: ${config.firmInputCsv}`);
+    }
+
+    firms = readApolloFirmInputCsv(config.firmInputCsv);
+    if (firms.length === 0) {
+      throw new Error(`No firm names found in ${config.firmInputCsv}`);
+    }
+
+    uniqueFirmEntries = buildApolloFirmLookupEntries(firms);
+
+    console.log(
+      `Apollo firm lookup: ${firms.length} input row(s), ${uniqueFirmEntries.length} unique firm name(s) to resolve.`
+    );
+    console.log(`Apollo firm lookup cache: loaded ${loadedCacheCount} cached firm match(es).`);
+
+    let page = null;
+    async function ensureApolloLookupPage() {
+      if (page) return page;
+      const apollo = await openApolloPage(config);
+      context = apollo.context;
+      page = apollo.page;
+      return page;
+    }
+
+    for (let index = 0; index < uniqueFirmEntries.length; index++) {
+      const firmEntry = uniqueFirmEntries[index];
+      const cachedRow = orgMatchCache.get(firmEntry.firmCacheKey);
+
+      if (cachedRow && !config.forceRefreshOrgMatches) {
+        const reusedRow = upsertApolloOrgMatchCache(orgMatchCache, {
+          ...cachedRow,
+          firmName: firmEntry.firmName,
+          firmCacheKey: firmEntry.firmCacheKey,
+        });
+        cacheHitCount += 1;
+        reportRows.push(reusedRow);
+
+        if (reusedRow.status === "resolved") {
+          console.log(
+            `  [Firm ${index + 1}/${uniqueFirmEntries.length}] ${firmEntry.firmName} -> cache hit ${reusedRow.orgId} (${reusedRow.matchedCompanyName})`
+          );
+        } else {
+          console.log(
+            `  [Firm ${index + 1}/${uniqueFirmEntries.length}] ${firmEntry.firmName} -> cache hit unresolved (${reusedRow.matchReason})`
+          );
+        }
+        continue;
+      }
+
+      if (cachedRow) {
+        refreshedCount += 1;
+      } else {
+        cacheMissCount += 1;
+      }
+
+      const lookupPage = await ensureApolloLookupPage();
+      if (apolloLookupCount > 0) {
+        await waitRandomActionDelay(lookupPage, config, "between Apollo company lookups");
+      }
+
+      try {
+        const payload = await fetchApolloCompanySearchPayload(lookupPage, firmEntry.firmName);
+        const candidates = extractApolloCompanyCandidates(payload);
+        const result = upsertApolloOrgMatchCache(
+          orgMatchCache,
+          selectApolloOrganizationMatch(firmEntry.firmName, candidates)
+        );
+        apolloLookupCount += 1;
+        reportRows.push(result);
+
+        if (cachedRow) {
+          console.log(
+            `  [Firm ${index + 1}/${uniqueFirmEntries.length}] ${firmEntry.firmName} -> refreshed ${result.status === "resolved" ? `${result.orgId} (${result.matchedCompanyName})` : `unresolved (${result.matchReason})`}`
+          );
+        } else {
+          if (result.status === "resolved") {
+            console.log(
+              `  [Firm ${index + 1}/${uniqueFirmEntries.length}] ${firmEntry.firmName} -> ${result.orgId} (${result.matchedCompanyName})`
+            );
+          } else {
+            console.log(
+              `  [Firm ${index + 1}/${uniqueFirmEntries.length}] ${firmEntry.firmName} -> unresolved (${result.matchReason})`
+            );
+          }
+        }
+      } catch (error) {
+        const result = upsertApolloOrgMatchCache(orgMatchCache, {
+          firmName: firmEntry.firmName,
+          firmCacheKey: firmEntry.firmCacheKey,
+          status: "unresolved",
+          orgId: "",
+          matchedCompanyName: "",
+          matchReason: `lookup_error: ${normalizeCell(error?.message || error)}`,
+        });
+        apolloLookupCount += 1;
+        reportRows.push(result);
+        if (cachedRow) {
+          console.log(
+            `  [Firm ${index + 1}/${uniqueFirmEntries.length}] ${firmEntry.firmName} -> refreshed unresolved (${result.matchReason})`
+          );
+        } else {
+          console.log(
+            `  [Firm ${index + 1}/${uniqueFirmEntries.length}] ${firmEntry.firmName} -> unresolved (${result.matchReason})`
+          );
+        }
+      }
+    }
+
+    console.log(
+      `Apollo firm lookup cache summary: ${cacheHitCount} hit(s), ${cacheMissCount} miss(es), ${refreshedCount} refresh(es), ${apolloLookupCount} Apollo lookup(s).`
+    );
+  } finally {
+    if (config.orgMatchReportCsv && (loadedCacheCount > 0 || reportRows.length > 0)) {
+      writeApolloOrgMatchReport(config.orgMatchReportCsv, [...orgMatchCache.values()]);
+    }
+    if (context) {
+      await context.close();
+    }
+  }
+
+  const resolvedOrgIds = dedupeNormalizedValues(
+    reportRows
+      .filter((row) => row.status === "resolved")
+      .map((row) => row.orgId)
+  );
+
+  if (resolvedOrgIds.length === 0) {
+    throw new Error(
+      `Apollo firm lookup completed, but no firms resolved to org ids. Check match report at ${config.orgMatchReportCsv}.`
+    );
+  }
+
+  const batch = buildApolloBatchFromOrganizationIds(
+    config.templateUrl,
+    resolvedOrgIds,
+    config.maxPagesPerOrg
+  );
+  writeApolloInputCsv(config.generatedInputCsv, batch.urls);
+
+  return {
+    firmCount: firms.length,
+    uniqueFirmCount: uniqueFirmEntries.length,
+    resolvedFirmCount: reportRows.filter((row) => row.status === "resolved").length,
+    unresolvedFirmCount: reportRows.filter((row) => row.status !== "resolved").length,
+    cacheHitCount,
+    cacheMissCount,
+    refreshedCount,
+    apolloLookupCount,
+    loadedCacheCount,
+    orgCount: batch.orgIds.length,
+    pageCount: batch.pageCount,
+    urlCount: batch.urls.length,
+    generatedInputCsv: config.generatedInputCsv,
+    orgMatchReportCsv: config.orgMatchReportCsv,
+  };
 }
 
 async function hydrateApolloRowsWithLinkedIn(page, rows, config) {
@@ -528,13 +1165,10 @@ async function runApolloScrape(config) {
 
   const batch = urls.slice(0, config.maxUrls);
   cleanupRawOutputDir(config.rawOutputDir, config.rawFilePrefix);
-  ensureDirectory(config.profileDir);
 
   console.log(`Apollo stage: ${batch.length} Apollo URL(s) to process (max: ${config.maxUrls})`);
 
-  const context = await launchApolloContext(config);
-  await importApolloFirefoxCookies(context, config);
-  const page = context.pages()[0] || (await context.newPage());
+  const { context, page } = await openApolloPage(config, null);
   const allRawRows = [];
   const rawFiles = [];
 
@@ -609,6 +1243,7 @@ async function runApolloScrape(config) {
     rawOutputDir: config.rawOutputDir,
     rawFiles,
     canonicalOutputCsv: config.canonicalOutputCsv,
+    canonicalRows,
     rawRowCount: allRawRows.length,
     canonicalRowCount: canonicalRows.length,
     urlCount: batch.length,
@@ -617,10 +1252,19 @@ async function runApolloScrape(config) {
 
 module.exports = {
   buildApolloBatchFromCombinedUrl,
+  buildApolloBatchFromOrganizationIds,
   buildCanonicalRows,
+  buildApolloFirmLookupEntries,
   buildRawFileName,
+  normalizeApolloCompanyName,
+  normalizeApolloFirmCacheKey,
   normalizeLinkedInUrl,
+  prepareApolloFirmInput,
   readApolloInputCsv,
+  readApolloFirmInputCsv,
+  readApolloOrgMatchReport,
   runApolloScrape,
+  selectApolloOrganizationMatch,
   writeApolloInputCsv,
+  writeApolloOrgMatchReport,
 };

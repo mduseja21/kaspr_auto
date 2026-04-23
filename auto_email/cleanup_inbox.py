@@ -1,43 +1,36 @@
 #!/usr/bin/env python3
 """Scan inbox for bounces & read receipts, update tracking.csv, and delete notifications."""
 
-import csv
+import argparse
 import json
-import os
 import re
-import sys
 import urllib.request
 import urllib.parse
 
-from outlook_auth import get_oauth2_token
-from config import get_provider
-
-TRACKING_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tracking.csv")
-TRACKING_HEADERS = [
-    "email", "name", "company_name", "sent_at",
-    "sender_account", "status", "read_receipt", "reply_detected", "reply_at",
-]
-
-
-def load_tracking():
-    if not os.path.exists(TRACKING_FILE):
-        return []
-    with open(TRACKING_FILE, newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-    cleaned = []
-    for row in rows:
-        clean = {}
-        for h in TRACKING_HEADERS:
-            clean[h] = row.get(h, "")
-        cleaned.append(clean)
-    return cleaned
+try:
+    from .outlook_auth import get_oauth2_token
+    from .config import get_provider
+except ImportError:
+    from outlook_auth import get_oauth2_token
+    from config import get_provider
+try:
+    from .master_tracking import (
+        default_tracking_path,
+        load_tracking as load_master_tracking,
+        normalize_email,
+        save_tracking,
+    )
+except ImportError:
+    from master_tracking import (
+        default_tracking_path,
+        load_tracking as load_master_tracking,
+        normalize_email,
+        save_tracking,
+    )
 
 
-def save_tracking(rows):
-    with open(TRACKING_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=TRACKING_HEADERS)
-        writer.writeheader()
-        writer.writerows(rows)
+def load_tracking(tracking_path):
+    return load_master_tracking(tracking_path)
 
 
 def graph_get(token, url):
@@ -74,14 +67,26 @@ def get_all_messages(token, top=500):
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Scan inbox for bounces & read receipts, update tracking.csv, and delete notifications."
+    )
+    parser.add_argument(
+        "--tracking",
+        default=default_tracking_path(),
+        help="Path to master tracking CSV file",
+    )
+    args = parser.parse_args()
+
     provider = get_provider()
     token = get_oauth2_token(provider["address"])
-    rows = load_tracking()
+    rows = load_tracking(args.tracking)
 
     # Build lookup by email
     tracking_by_email = {}
     for row in rows:
-        tracking_by_email[row["email"].lower()] = row
+        email = normalize_email(row["email"])
+        if email:
+            tracking_by_email[email] = row
 
     print("Fetching inbox messages...")
     messages = get_all_messages(token)
@@ -121,8 +126,8 @@ def main():
     updated = 0
     for email in bounced_emails:
         row = tracking_by_email[email]
-        if row["status"] == "sent":
-            row["status"] = "bounced"
+        if row["email_send_status"] == "sent":
+            row["email_send_status"] = "bounced"
             updated += 1
 
     for email in read_emails:
@@ -132,7 +137,7 @@ def main():
             updated += 1
 
     if updated:
-        save_tracking(rows)
+        save_tracking(rows, args.tracking)
 
     print(f"\nTracking updated:")
     print(f"  Bounced: {len(bounced_emails)} emails marked as bounced")
@@ -152,9 +157,9 @@ def main():
     print(f"Deleted: {deleted} | Failed: {failed}")
 
     # Print summary table
-    sent_rows = [r for r in rows if r["status"] in ("sent", "bounced")]
-    total = len([r for r in rows if r["status"] == "sent"])
-    bounced = len([r for r in rows if r["status"] == "bounced"])
+    sent_rows = [r for r in rows if r["email_send_status"] in ("sent", "bounced")]
+    total = len([r for r in rows if r["email_send_status"] == "sent"])
+    bounced = len([r for r in rows if r["email_send_status"] == "bounced"])
     reads = len([r for r in rows if r.get("read_receipt") == "True"])
     replies = len([r for r in rows if r.get("reply_detected") == "True"])
 

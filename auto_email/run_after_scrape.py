@@ -7,13 +7,18 @@ import subprocess
 import sys
 from pathlib import Path
 
-from prepare_contacts import build_contacts, load_scrape_rows, write_contacts
+try:
+    from .prepare_contacts import build_contacts, load_tracking_rows, write_contacts
+    from .master_tracking import default_tracking_path
+except ImportError:
+    from prepare_contacts import build_contacts, load_tracking_rows, write_contacts
+    from master_tracking import default_tracking_path
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_RESULTS = BASE_DIR.parent / "results.csv"
 DEFAULT_CONTACTS = BASE_DIR / "contacts_from_scrape.csv"
 DEFAULT_TEMPLATE = BASE_DIR / "templates" / "sample.txt"
-DEFAULT_TRACKING = BASE_DIR / "tracking.csv"
+DEFAULT_TRACKING = Path(default_tracking_path()).resolve()
 DEFAULT_SOURCE_TRACKING = ""
 
 
@@ -45,6 +50,8 @@ def run_email_sender(args):
         str(BASE_DIR / "send_emails.py"),
         "--contacts",
         str(args.contacts_out),
+        "--tracking",
+        str(args.tracking),
         "--template",
         str(args.template),
     ]
@@ -69,6 +76,7 @@ def main():
         description="Turn scrape results into contacts and launch the email sender."
     )
     parser.add_argument("--results", default=str(DEFAULT_RESULTS), help="Path to scraper results CSV.")
+    parser.add_argument("--tracking", default=str(DEFAULT_TRACKING), help="Path to master tracking CSV.")
     parser.add_argument("--contacts-out", default=str(DEFAULT_CONTACTS), help="Output contacts CSV path.")
     parser.add_argument("--template", default=str(DEFAULT_TEMPLATE), help="Email template path.")
     parser.add_argument(
@@ -84,23 +92,24 @@ def main():
     args = parser.parse_args()
 
     args.results = Path(args.results).resolve()
+    args.tracking = Path(args.tracking).resolve()
     args.contacts_out = Path(args.contacts_out).resolve()
     args.template = Path(args.template).resolve()
     args.source_tracking = str(Path(args.source_tracking).resolve()) if args.source_tracking else ""
 
-    sync_file(args.source_tracking, DEFAULT_TRACKING, "Tracking sync in")
+    sync_file(args.source_tracking, args.tracking, "Tracking sync in")
 
-    rows = load_scrape_rows(args.results)
+    rows = load_tracking_rows(args.tracking)
     contacts = build_contacts(rows)
     write_contacts(args.contacts_out, contacts)
-    print(f"Prepared {len(contacts)} contacts from {args.results}")
+    print(f"Prepared {len(contacts)} contacts from master tracking {args.tracking}")
 
     if not contacts:
         print("No contacts with emails were found. Skipping send step.")
         return
 
     run_email_sender(args)
-    sync_file(DEFAULT_TRACKING, args.source_tracking, "Tracking sync back")
+    sync_file(args.tracking, args.source_tracking, "Tracking sync back")
 
 
 if __name__ == "__main__":
