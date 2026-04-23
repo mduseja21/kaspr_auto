@@ -6,6 +6,9 @@ chrome-data/
 .helium_test_profile.*/
 *.csv
 !linkedin_urls.csv
+*.db
+*.db-shm
+*.db-wal
 .DS_Store
 run.log
 auto_email/.env
