@@ -526,13 +526,25 @@ function tokenizeApolloCompanyName(value) {
   const normalized = normalizeCell(value)
     .toLowerCase()
     .replace(/&/g, " and ")
-    .replace(/['’]/g, "")
+    .replace(/[‘’]/g, "")
     .replace(/[^a-z0-9]+/g, " ");
 
   const tokens = normalized.split(/\s+/).filter(Boolean);
 
   if (tokens[0] === "the" && tokens.length > 1) {
     tokens.shift();
+  }
+
+  // Rejoin split legal suffixes like "L.P." -> ["l", "p"] back to "lp"
+  if (
+    tokens.length >= 3 &&
+    tokens[tokens.length - 2].length === 1 &&
+    tokens[tokens.length - 1].length === 1
+  ) {
+    const joined = tokens[tokens.length - 2] + tokens[tokens.length - 1];
+    if (COMPANY_ENTITY_SUFFIX_TOKENS.has(joined)) {
+      tokens.splice(tokens.length - 2, 2, joined);
+    }
   }
 
   while (tokens.length > 1 && COMPANY_ENTITY_SUFFIX_TOKENS.has(tokens[tokens.length - 1])) {
@@ -684,6 +696,19 @@ function selectApolloOrganizationMatch(firmName, candidates) {
   const tiedCandidates = scoredCandidates.filter((candidate) => candidate.score === topCandidate.score);
 
   if (tiedCandidates.length > 1) {
+    const uniqueNormalizedNames = new Set(
+      tiedCandidates.map((c) => normalizeApolloCompanyName(c.candidate.name))
+    );
+    if (uniqueNormalizedNames.size === 1) {
+      return {
+        firmName,
+        status: "resolved",
+        orgId: topCandidate.candidate.orgId,
+        matchedCompanyName: topCandidate.candidate.name,
+        matchReason: `${topCandidate.reason}_deduped_variants`,
+      };
+    }
+
     const ambiguousNames = tiedCandidates
       .slice(0, 3)
       .map((candidate) => candidate.candidate.name)
@@ -921,8 +946,14 @@ async function fetchApolloPersonPayload(page, personId) {
   }, { personId, cacheKey: Date.now() });
 }
 
+function buildApolloSearchQuery(firmName) {
+  const normalized = normalizeApolloCompanyName(firmName);
+  return normalized || normalizeCell(firmName);
+}
+
 async function fetchApolloCompanySearchPayload(page, firmName, perPage = APOLLO_COMPANY_LOOKUP_PER_PAGE) {
-  return page.evaluate(async ({ path, firmName, perPage, cacheKey }) => {
+  const searchQuery = buildApolloSearchQuery(firmName);
+  return page.evaluate(async ({ path, searchQuery, perPage, cacheKey }) => {
     const response = await fetch(path, {
       method: "POST",
       credentials: "include",
@@ -931,7 +962,7 @@ async function fetchApolloCompanySearchPayload(page, firmName, perPage = APOLLO_
         "content-type": "application/json",
       },
       body: JSON.stringify({
-        q_organization_name: firmName,
+        q_organization_name: searchQuery,
         page: 1,
         per_page: perPage,
         cacheKey,
@@ -939,13 +970,13 @@ async function fetchApolloCompanySearchPayload(page, firmName, perPage = APOLLO_
     });
 
     if (!response.ok) {
-      throw new Error(`Apollo company lookup failed for "${firmName}": ${response.status}`);
+      throw new Error(`Apollo company lookup failed for "${searchQuery}": ${response.status}`);
     }
 
     return response.json();
   }, {
     path: APOLLO_COMPANY_SEARCH_PATH,
-    firmName,
+    searchQuery,
     perPage,
     cacheKey: Date.now(),
   });
@@ -1034,6 +1065,11 @@ async function prepareApolloFirmInput(config) {
     console.log(`Apollo firm lookup cache: loaded ${loadedCacheCount} cached firm match(es).`);
 
     let page = null;
+    const CONSECUTIVE_ERROR_BACKOFF_THRESHOLD = 3;
+    const MAX_BACKOFF_ATTEMPTS = 4;
+    const BASE_BACKOFF_MS = 15000;
+    let consecutiveErrors = 0;
+
     async function ensureApolloLookupPage() {
       if (page) return page;
       const apollo = await openApolloPage(config);
@@ -1042,11 +1078,21 @@ async function prepareApolloFirmInput(config) {
       return page;
     }
 
+    async function resetApolloLookupPage() {
+      if (context) {
+        try { await context.close(); } catch {}
+        context = null;
+        page = null;
+      }
+      return ensureApolloLookupPage();
+    }
+
     for (let index = 0; index < uniqueFirmEntries.length; index++) {
       const firmEntry = uniqueFirmEntries[index];
       const cachedRow = orgMatchCache.get(firmEntry.firmCacheKey);
 
-      if (cachedRow && !config.forceRefreshOrgMatches) {
+      const isRetryableCache = cachedRow && (cachedRow.matchReason || "").startsWith("lookup_error");
+      if (cachedRow && !config.forceRefreshOrgMatches && !isRetryableCache) {
         const reusedRow = upsertApolloOrgMatchCache(orgMatchCache, {
           ...cachedRow,
           firmName: firmEntry.firmName,
@@ -1073,7 +1119,7 @@ async function prepareApolloFirmInput(config) {
         cacheMissCount += 1;
       }
 
-      const lookupPage = await ensureApolloLookupPage();
+      let lookupPage = await ensureApolloLookupPage();
       if (apolloLookupCount > 0) {
         await waitRandomActionDelay(lookupPage, config, "between Apollo company lookups");
       }
@@ -1086,6 +1132,7 @@ async function prepareApolloFirmInput(config) {
           selectApolloOrganizationMatch(firmEntry.firmName, candidates)
         );
         apolloLookupCount += 1;
+        consecutiveErrors = 0;
         reportRows.push(result);
 
         if (cachedRow) {
@@ -1104,24 +1151,66 @@ async function prepareApolloFirmInput(config) {
           }
         }
       } catch (error) {
-        const result = upsertApolloOrgMatchCache(orgMatchCache, {
-          firmName: firmEntry.firmName,
-          firmCacheKey: firmEntry.firmCacheKey,
-          status: "unresolved",
-          orgId: "",
-          matchedCompanyName: "",
-          matchReason: `lookup_error: ${normalizeCell(error?.message || error)}`,
-        });
+        consecutiveErrors += 1;
         apolloLookupCount += 1;
-        reportRows.push(result);
-        if (cachedRow) {
-          console.log(
-            `  [Firm ${index + 1}/${uniqueFirmEntries.length}] ${firmEntry.firmName} -> refreshed unresolved (${result.matchReason})`
-          );
+
+        if (consecutiveErrors >= CONSECUTIVE_ERROR_BACKOFF_THRESHOLD) {
+          let recovered = false;
+
+          for (let attempt = 1; attempt <= MAX_BACKOFF_ATTEMPTS; attempt++) {
+            const backoffMs = BASE_BACKOFF_MS * Math.pow(2, attempt - 1);
+            console.log(
+              `  Rate limit detected (${consecutiveErrors} consecutive errors). Backing off ${(backoffMs / 1000).toFixed(0)}s (attempt ${attempt}/${MAX_BACKOFF_ATTEMPTS})...`
+            );
+            await new Promise((r) => setTimeout(r, backoffMs));
+
+            lookupPage = await resetApolloLookupPage();
+
+            try {
+              const retryPayload = await fetchApolloCompanySearchPayload(lookupPage, firmEntry.firmName);
+              const retryCandidates = extractApolloCompanyCandidates(retryPayload);
+              const retryResult = upsertApolloOrgMatchCache(
+                orgMatchCache,
+                selectApolloOrganizationMatch(firmEntry.firmName, retryCandidates)
+              );
+              reportRows.push(retryResult);
+              consecutiveErrors = 0;
+              recovered = true;
+              console.log(
+                `  [Firm ${index + 1}/${uniqueFirmEntries.length}] ${firmEntry.firmName} -> recovered: ${retryResult.status === "resolved" ? `${retryResult.orgId} (${retryResult.matchedCompanyName})` : `unresolved (${retryResult.matchReason})`}`
+              );
+              break;
+            } catch (retryError) {
+              console.log(`  Backoff retry ${attempt} failed: ${normalizeCell(retryError?.message || retryError)}`);
+            }
+          }
+
+          if (!recovered) {
+            const remaining = uniqueFirmEntries.length - index;
+            console.log(
+              `  Apollo rate limit: could not recover after ${MAX_BACKOFF_ATTEMPTS} backoff attempts. Skipping remaining ${remaining} firm(s). Re-run to retry from cache.`
+            );
+            break;
+          }
         } else {
-          console.log(
-            `  [Firm ${index + 1}/${uniqueFirmEntries.length}] ${firmEntry.firmName} -> unresolved (${result.matchReason})`
-          );
+          const result = upsertApolloOrgMatchCache(orgMatchCache, {
+            firmName: firmEntry.firmName,
+            firmCacheKey: firmEntry.firmCacheKey,
+            status: "unresolved",
+            orgId: "",
+            matchedCompanyName: "",
+            matchReason: `lookup_error: ${normalizeCell(error?.message || error)}`,
+          });
+          reportRows.push(result);
+          if (cachedRow) {
+            console.log(
+              `  [Firm ${index + 1}/${uniqueFirmEntries.length}] ${firmEntry.firmName} -> refreshed unresolved (${result.matchReason})`
+            );
+          } else {
+            console.log(
+              `  [Firm ${index + 1}/${uniqueFirmEntries.length}] ${firmEntry.firmName} -> unresolved (${result.matchReason})`
+            );
+          }
         }
       }
     }
@@ -1422,6 +1511,7 @@ async function runApolloScrape(config) {
 module.exports = {
   buildApolloBatchFromCombinedUrl,
   buildApolloBatchFromOrganizationIds,
+  buildApolloSearchQuery,
   buildCanonicalRows,
   buildApolloFirmLookupEntries,
   buildRawFileName,
