@@ -853,6 +853,34 @@ async function assertApolloSessionReady(page) {
   return diagnostics;
 }
 
+async function detectCloudflareChallenge(page) {
+  return page.evaluate(() => {
+    const body = document.body?.innerText || "";
+    const title = document.title || "";
+    const combined = (body + " " + title).toLowerCase();
+    const hasTurnstile = !!document.querySelector("#challenge-running, #challenge-stage, .cf-turnstile, [data-sitekey]");
+    const hasText = combined.includes("verify you are human") ||
+      combined.includes("checking your browser") ||
+      combined.includes("just a moment") ||
+      combined.includes("cloudflare");
+    return hasTurnstile || hasText;
+  });
+}
+
+async function waitForCloudflareResolution(page) {
+  console.log("  Cloudflare challenge detected. Waiting for resolution (Capsolver or manual)...");
+
+  while (true) {
+    await new Promise((r) => setTimeout(r, 3000));
+    const stillBlocked = await detectCloudflareChallenge(page);
+    if (!stillBlocked) {
+      console.log("  Cloudflare challenge resolved!");
+      await new Promise((r) => setTimeout(r, 2000));
+      return true;
+    }
+  }
+}
+
 async function openApolloPage(config, bootstrapUrl = APOLLO_BOOTSTRAP_URL) {
   ensureDirectory(config.profileDir);
 
@@ -866,6 +894,11 @@ async function openApolloPage(config, bootstrapUrl = APOLLO_BOOTSTRAP_URL) {
         waitUntil: "domcontentloaded",
         timeout: config.pageTimeoutMs,
       });
+
+      if (await detectCloudflareChallenge(page)) {
+        await waitForCloudflareResolution(page);
+      }
+
       await waitRandomActionDelay(page, config, "after Apollo bootstrap navigation");
       await assertApolloSessionReady(page);
     }
@@ -1176,6 +1209,11 @@ async function prepareApolloFirmInput(config) {
 
             lookupPage = await resetApolloLookupPage();
 
+            if (await detectCloudflareChallenge(lookupPage)) {
+              console.log("  Cloudflare challenge detected during firm resolution...");
+              await waitForCloudflareResolution(lookupPage);
+            }
+
             try {
               const retryPayload = await fetchApolloCompanySearchPayload(lookupPage, firmEntry.firmName);
               const retryCandidates = extractApolloCompanyCandidates(retryPayload);
@@ -1457,6 +1495,17 @@ async function runApolloScrape(config) {
               waitUntil: "domcontentloaded",
               timeout: config.pageTimeoutMs,
             });
+
+            if (await detectCloudflareChallenge(page)) {
+              const resolved = await waitForCloudflareResolution(page);
+              if (resolved) {
+                await page.goto(url, {
+                  waitUntil: "domcontentloaded",
+                  timeout: config.pageTimeoutMs,
+                });
+              }
+            }
+
             await waitRandomActionDelay(page, config, "after Apollo navigation");
 
             await assertApolloSessionReady(page);
