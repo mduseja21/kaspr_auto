@@ -897,6 +897,7 @@ async function runApolloStage(db) {
     rawFilePrefix: CONFIG.apolloRawFilePrefix,
     canonicalOutputCsv: CONFIG.apolloCanonicalOutputCsv,
     maxUrls: CONFIG.apolloMaxUrls,
+    maxPagesPerOrg: CONFIG.apolloMaxPagesPerOrg,
     onRowsScraped: db ? (rows) => trackingDb.upsertRows(db, rows, "apollo") : undefined,
   });
   console.log(

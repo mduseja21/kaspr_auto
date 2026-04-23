@@ -18,7 +18,9 @@ const APOLLO_ORG_PARAM = "organizationIds[]";
 const APOLLO_TITLE_PARAM = "personTitles[]";
 const APOLLO_BOOTSTRAP_URL = "https://app.apollo.io/#/people";
 const APOLLO_COMPANY_SEARCH_PATH = "/api/v1/mixed_companies/search";
+const APOLLO_PEOPLE_SEARCH_PATH = "/api/v1/mixed_people/search";
 const APOLLO_COMPANY_LOOKUP_PER_PAGE = 5;
+const APOLLO_PEOPLE_SEARCH_PER_PAGE = 25;
 const APOLLO_RESULT_SELECTORS = [
   '[role="row"] [data-testid="contact-name-cell"] a',
   '[role="gridcell"][aria-colindex="1"] [data-testid="contact-name-cell"] a',
@@ -989,6 +991,85 @@ async function fetchApolloPersonPayload(page, personId) {
   }, { personId, cacheKey: Date.now() });
 }
 
+const APOLLO_URL_TO_API_PARAM_MAP = {
+  "personTitles[]": "person_titles",
+  "personLocations[]": "person_locations",
+  "contactEmailStatusV2[]": "contact_email_status",
+  "prospectedByCurrentTeam[]": "prospected_by_current_team",
+};
+
+function extractSearchFiltersFromTemplateUrl(templateUrl) {
+  const parsed = parseApolloPeopleSearchUrl(templateUrl);
+  const filters = {};
+
+  for (const [urlParam, apiParam] of Object.entries(APOLLO_URL_TO_API_PARAM_MAP)) {
+    const values = parsed.orderedEntries
+      .filter(([key]) => key === urlParam)
+      .map(([, value]) => normalizeCell(value))
+      .filter(Boolean);
+    if (values.length > 0) filters[apiParam] = values;
+  }
+
+  return filters;
+}
+
+async function fetchApolloPeopleSearch(page, { orgId, filters, pageNumber = 1, perPage = APOLLO_PEOPLE_SEARCH_PER_PAGE }) {
+  return page.evaluate(async ({ path, params, cacheKey }) => {
+    const response = await fetch(path, {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ ...params, cacheKey }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Apollo people search failed: ${response.status}`);
+    }
+
+    return response.json();
+  }, {
+    path: APOLLO_PEOPLE_SEARCH_PATH,
+    params: {
+      page: pageNumber,
+      per_page: perPage,
+      organization_ids: [orgId],
+      ...filters,
+    },
+    cacheKey: Date.now(),
+  });
+}
+
+function extractPeopleFromSearchResponse(response) {
+  const people = Array.isArray(response?.people) ? response.people
+    : Array.isArray(response?.contacts) ? response.contacts
+    : [];
+
+  return people.map((person) => {
+    const personId = normalizeCell(person?.id || "");
+    const name = normalizeCell(
+      person?.name || `${person?.first_name || ""} ${person?.last_name || ""}`.trim()
+    );
+    const title = normalizeCell(person?.title || "");
+    const orgName = normalizeCell(
+      person?.organization?.name || person?.organization_name || ""
+    );
+    const linkedinUrl = normalizeCell(person?.linkedin_url || "");
+
+    return { personId, Name: name, Title: title, Company: orgName, linkedinUrl };
+  }).filter((p) => p.personId);
+}
+
+function getPaginationFromSearchResponse(response) {
+  return {
+    totalEntries: response?.pagination?.total_entries || 0,
+    totalPages: response?.pagination?.total_pages || 0,
+    currentPage: response?.pagination?.page || 1,
+  };
+}
+
 function buildApolloSearchQuery(firmName) {
   const normalized = normalizeApolloCompanyName(firmName);
   return normalized || normalizeCell(firmName);
@@ -1409,218 +1490,224 @@ async function runApolloScrape(config) {
     throw new Error(`No valid Apollo search URLs found in ${config.inputCsv}`);
   }
 
-  const batch = urls.slice(0, config.maxUrls);
-  const progress = loadApolloProgress(config.rawOutputDir);
-  const skippedCount = batch.filter((url) => progress.completedUrls[url]).length;
+  // Parse search filters from the first URL (they share the same base filters)
+  const searchFilters = extractSearchFiltersFromTemplateUrl(urls[0]);
 
-  if (skippedCount === batch.length) {
-    console.log(`Apollo stage: all ${batch.length} URL(s) already completed. Reloading raw output.`);
-  } else if (skippedCount > 0) {
-    console.log(
-      `Apollo stage: ${batch.length} URL(s) total, ${skippedCount} already completed, ${batch.length - skippedCount} remaining.`
-    );
-  } else {
-    cleanupRawOutputDir(config.rawOutputDir, config.rawFilePrefix);
-    console.log(`Apollo stage: ${batch.length} Apollo URL(s) to process (max: ${config.maxUrls})`);
+  // Extract unique titles and org IDs across all URLs
+  const titles = dedupeNormalizedValues(
+    urls.map((url) => extractApolloUrlKey(url).title).filter(Boolean)
+  );
+  const orgIds = dedupeNormalizedValues(
+    urls.map((url) => extractApolloUrlKey(url).orgId).filter(Boolean)
+  );
+  const combos = [];
+  for (const orgId of orgIds) {
+    if (titles.length > 1) {
+      for (const title of titles) {
+        combos.push({ orgId, title, comboKey: `${orgId}::${title}` });
+      }
+    } else {
+      combos.push({ orgId, title: titles[0] || "", comboKey: `${orgId}::${titles[0] || ""}` });
+    }
   }
 
-  const allRawRows = [];
+  const progress = loadApolloProgress(config.rawOutputDir);
+  const completedCombos = new Set(
+    Object.keys(progress.completedUrls).filter((key) => progress.completedUrls[key].completed)
+  );
+  const pendingCombos = combos.filter((c) => !completedCombos.has(c.comboKey));
+
+  console.log(
+    `Apollo stage: ${combos.length} org+title combo(s), ${completedCombos.size} already completed, ${pendingCombos.length} remaining.`
+  );
+
+  const allCanonicalRows = [];
   const rawFiles = [];
 
-  // Reload raw rows from previously completed URLs
-  const reloadedRawRows = [];
-  for (let index = 0; index < batch.length; index++) {
-    const url = batch[index];
-    if (!progress.completedUrls[url]) continue;
-    const rawFilePath = path.join(
-      config.rawOutputDir,
-      buildRawFileName(config.rawFilePrefix, index + 1)
-    );
+  // Reload canonical rows from previously completed combos
+  for (const comboKey of completedCombos) {
+    const info = progress.completedUrls[comboKey];
+    const rawFilePath = path.join(config.rawOutputDir, `${config.rawFilePrefix}${comboKey.replace(/[^a-zA-Z0-9]/g, "_")}.csv`);
     if (fs.existsSync(rawFilePath)) {
       const existing = readRawCsvRows(rawFilePath);
-      allRawRows.push(...existing);
-      reloadedRawRows.push(...existing);
+      const canonical = buildCanonicalRows(existing);
+      allCanonicalRows.push(...canonical);
       rawFiles.push(rawFilePath);
     }
   }
 
-  if (reloadedRawRows.length > 0 && typeof config.onRowsScraped === "function") {
-    const reloadedCanonical = buildCanonicalRows(reloadedRawRows);
-    if (reloadedCanonical.length > 0) {
-      config.onRowsScraped(reloadedCanonical);
-      console.log(`Reloaded ${reloadedCanonical.length} canonical row(s) from previous progress into tracking.`);
-    }
+  if (allCanonicalRows.length > 0 && typeof config.onRowsScraped === "function") {
+    config.onRowsScraped(allCanonicalRows);
+    console.log(`Reloaded ${allCanonicalRows.length} canonical row(s) from previous progress into tracking.`);
   }
 
-  // Process remaining URLs
-  const pending = batch.filter((url) => !progress.completedUrls[url]);
-  const exhaustedCombos = new Set();
+  if (pendingCombos.length > 0) {
+    let { context, page } = await openApolloPage(config, APOLLO_BOOTSTRAP_URL);
 
-  // Detect combos already exhausted from previous progress
-  for (const [url, info] of Object.entries(progress.completedUrls)) {
-    if (info.rowCount === 0) {
-      const { comboKey } = extractApolloUrlKey(url);
-      if (comboKey) exhaustedCombos.add(comboKey);
-    }
-  }
-
-  if (pending.length > 0) {
-    let { context, page } = await openApolloPage(config, null);
-
-    const SCRAPE_CONSECUTIVE_EMPTY_THRESHOLD = 3;
-    const SCRAPE_PAUSE_MS = 300000; // 5 minutes
+    const SCRAPE_CONSECUTIVE_ERROR_THRESHOLD = 3;
+    const SCRAPE_PAUSE_MS = 300000;
     const SCRAPE_MAX_PAUSE_RETRIES = 3;
     const SESSION_ROTATION_INTERVAL = 100;
     const BREAK_INTERVAL_MIN = 50;
     const BREAK_INTERVAL_MAX = 80;
 
-    let consecutiveEmpty = 0;
+    let consecutiveErrors = 0;
     let successCount = 0;
-    let urlsSinceBreak = 0;
+    let combosSinceBreak = 0;
     let nextBreakAt = randomIntBetween(BREAK_INTERVAL_MIN, BREAK_INTERVAL_MAX);
 
     try {
-      for (let index = 0; index < batch.length; index++) {
-        const url = batch[index];
-        if (progress.completedUrls[url]) continue;
+      for (let comboIndex = 0; comboIndex < combos.length; comboIndex++) {
+        const combo = combos[comboIndex];
+        if (completedCombos.has(combo.comboKey)) continue;
 
-        const urlKey = extractApolloUrlKey(url);
-        if (urlKey.comboKey && exhaustedCombos.has(urlKey.comboKey)) {
-          console.log(`\n[Apollo ${index + 1}/${batch.length}] SKIP page ${urlKey.page} (earlier page was empty for this org+title)`);
-          progress.completedUrls[url] = { completedAt: new Date().toISOString(), rowCount: 0, skipped: true };
-          saveApolloProgress(config.rawOutputDir, progress);
-          continue;
-        }
+        const titleFilter = combo.title
+          ? { ...searchFilters, person_titles: [combo.title] }
+          : searchFilters;
 
-        const rawFilePath = path.join(
-          config.rawOutputDir,
-          buildRawFileName(config.rawFilePrefix, index + 1)
+        console.log(
+          `\n[Apollo ${comboIndex + 1}/${combos.length}] org=${combo.orgId} title="${combo.title}"`
         );
 
-        console.log(`\n[Apollo ${index + 1}/${batch.length}] ${url}`);
+        let comboRawRows = [];
+        let totalPages = 1;
 
-        let rawRows = [];
-        let attempt = 0;
-        while (attempt < 2) {
+        const maxPages = Number.isFinite(config.maxPagesPerOrg) ? config.maxPagesPerOrg : 5;
+        for (let pageNum = 1; pageNum <= Math.min(totalPages, maxPages); pageNum++) {
+          await waitRandomActionDelay(page, config, `before API call (page ${pageNum})`);
+
           try {
-            await page.goto(url, {
-              waitUntil: "domcontentloaded",
-              timeout: config.pageTimeoutMs,
+            const response = await fetchApolloPeopleSearch(page, {
+              orgId: combo.orgId,
+              filters: titleFilter,
+              pageNumber: pageNum,
             });
 
-            if (await detectCloudflareChallenge(page)) {
-              const resolved = await waitForCloudflareResolution(page);
-              if (resolved) {
-                await page.goto(url, {
-                  waitUntil: "domcontentloaded",
-                  timeout: config.pageTimeoutMs,
-                });
+            const pagination = getPaginationFromSearchResponse(response);
+            totalPages = pagination.totalPages;
+
+            const people = extractPeopleFromSearchResponse(response);
+            console.log(
+              `  Page ${pageNum}/${totalPages}: ${people.length} people (${pagination.totalEntries} total entries)`
+            );
+            if (people.length === 0) {
+              break;
+            }
+
+            // Enrich with LinkedIn URLs via person detail API only if not in search response
+            let enrichedCount = 0;
+            for (let pIndex = 0; pIndex < people.length; pIndex++) {
+              const person = people[pIndex];
+              if (!person.linkedinUrl && person.personId) {
+                if (enrichedCount > 0) {
+                  await waitRandomActionDelay(page, config, "between person detail fetches");
+                }
+                try {
+                  const payload = await fetchApolloPersonPayload(page, person.personId);
+                  const detail = payload?.person || {};
+                  person.linkedinUrl = normalizeCell(detail.linkedin_url || "");
+                  if (!person.Name) person.Name = normalizeCell(detail.name || `${detail.first_name || ""} ${detail.last_name || ""}`.trim());
+                  if (!person.Title) person.Title = normalizeCell(detail.title || "");
+                  if (!person.Company) person.Company = normalizeCell(detail.organization?.name || "");
+                  enrichedCount++;
+                } catch (detailErr) {
+                  console.log(`  Person detail fetch failed for ${person.personId}: ${detailErr.message}`);
+                }
               }
+
+              comboRawRows.push([
+                person.Name || "",
+                person.Title || "",
+                person.Company || "",
+                person.linkedinUrl || "",
+              ]);
             }
 
-            await waitRandomActionDelay(page, config, "after Apollo navigation");
-
-            await assertApolloSessionReady(page);
-
-            const foundResults = await waitForApolloResults(page, config.resultsSelectorTimeoutMs);
-            if (!foundResults) {
-              console.log("  Apollo results did not render before timeout. Capturing current page anyway...");
-              await assertApolloSessionReady(page);
-            }
-
-            const visibleRows = await extractApolloVisibleRows(page);
-            rawRows = await hydrateApolloRowsWithLinkedIn(page, visibleRows, config);
-            console.log(`  Captured ${rawRows.length} raw Apollo row(s).`);
-            break;
+            consecutiveErrors = 0;
           } catch (error) {
-            const retryable = /timeout|ERR_ABORTED|Navigation/i.test(error?.message || "");
-            const shouldRetry = retryable && attempt === 0;
+            consecutiveErrors++;
+            console.log(`  API error on page ${pageNum}: ${error.message}`);
 
-            if (shouldRetry) {
-              console.log(`  Apollo navigation failed (${error.message}). Retrying once...`);
-              attempt++;
-              continue;
-            }
+            if (consecutiveErrors >= SCRAPE_CONSECUTIVE_ERROR_THRESHOLD) {
+              let recovered = false;
+              for (let pauseAttempt = 1; pauseAttempt <= SCRAPE_MAX_PAUSE_RETRIES; pauseAttempt++) {
+                console.log(
+                  `  Rate limit detected (${consecutiveErrors} consecutive errors). Pausing ${(SCRAPE_PAUSE_MS / 60000).toFixed(0)} min (attempt ${pauseAttempt}/${SCRAPE_MAX_PAUSE_RETRIES})...`
+                );
+                await new Promise((r) => setTimeout(r, SCRAPE_PAUSE_MS));
+                console.log("  Refreshing browser session...");
+                await context.close();
+                ({ context, page } = await openApolloPage(config, APOLLO_BOOTSTRAP_URL));
 
-            throw error;
-          }
-        }
-
-        if (rawRows.length === 0 && urlKey.comboKey) {
-          exhaustedCombos.add(urlKey.comboKey);
-        }
-
-        // Track consecutive empty pages for rate limit detection
-        if (rawRows.length === 0) {
-          consecutiveEmpty++;
-          if (consecutiveEmpty >= SCRAPE_CONSECUTIVE_EMPTY_THRESHOLD) {
-            let recovered = false;
-            for (let pauseAttempt = 1; pauseAttempt <= SCRAPE_MAX_PAUSE_RETRIES; pauseAttempt++) {
-              console.log(
-                `  Possible rate limit (${consecutiveEmpty} consecutive empty pages). Pausing ${(SCRAPE_PAUSE_MS / 60000).toFixed(0)} min (attempt ${pauseAttempt}/${SCRAPE_MAX_PAUSE_RETRIES})...`
-              );
-              await new Promise((r) => setTimeout(r, SCRAPE_PAUSE_MS));
-              console.log("  Refreshing browser session...");
-              await context.close();
-              ({ context, page } = await openApolloPage(config, null));
-              // Retry the current URL
-              try {
-                await page.goto(url, { waitUntil: "domcontentloaded", timeout: config.pageTimeoutMs });
-                if (await detectCloudflareChallenge(page)) {
-                  await waitForCloudflareResolution(page);
-                  await page.goto(url, { waitUntil: "domcontentloaded", timeout: config.pageTimeoutMs });
+                try {
+                  const retryResponse = await fetchApolloPeopleSearch(page, {
+                    orgId: combo.orgId,
+                    filters: titleFilter,
+                    pageNumber: pageNum,
+                  });
+                  const retryPeople = extractPeopleFromSearchResponse(retryResponse);
+                  if (retryPeople.length > 0) {
+                    console.log(`  Recovered after pause! ${retryPeople.length} people on page ${pageNum}.`);
+                    consecutiveErrors = 0;
+                    recovered = true;
+                    // Continue with this page's results
+                    totalPages = getPaginationFromSearchResponse(retryResponse).totalPages;
+                    for (const person of retryPeople) {
+                      comboRawRows.push([person.Name || "", person.Title || "", person.Company || "", person.linkedinUrl || ""]);
+                    }
+                    break;
+                  }
+                } catch (retryErr) {
+                  console.log(`  Pause retry ${pauseAttempt} failed: ${retryErr.message}`);
                 }
-                await waitRandomActionDelay(page, config, "after pause retry navigation");
-                const retryVisible = await extractApolloVisibleRows(page);
-                if (retryVisible.length > 0) {
-                  rawRows = await hydrateApolloRowsWithLinkedIn(page, retryVisible, config);
-                  console.log(`  Recovered after pause! Captured ${rawRows.length} row(s).`);
-                  consecutiveEmpty = 0;
-                  recovered = true;
-                  break;
-                }
-              } catch (retryErr) {
-                console.log(`  Pause retry ${pauseAttempt} failed: ${retryErr.message}`);
               }
+              if (!recovered) {
+                console.log("  Could not recover. Skipping remaining pages for this combo.");
+                break;
+              }
+            } else {
+              break; // Skip remaining pages for this combo on error
             }
-            if (!recovered) {
-              console.log("  Could not recover after pauses. Continuing (may be legit empty pages).");
-              consecutiveEmpty = 0;
-            }
-          }
-        } else {
-          consecutiveEmpty = 0;
-          successCount++;
-
-          // Session rotation every N successful scrapes
-          if (successCount % SESSION_ROTATION_INTERVAL === 0) {
-            console.log(`\n  Session rotation after ${successCount} successful scrapes. Refreshing browser...`);
-            await context.close();
-            ({ context, page } = await openApolloPage(config, null));
           }
         }
 
-        writeRawRows(rawFilePath, rawRows);
+        // Save raw rows for this combo
+        const rawFilePath = path.join(config.rawOutputDir, `${config.rawFilePrefix}${combo.comboKey.replace(/[^a-zA-Z0-9]/g, "_")}.csv`);
+        writeRawRows(rawFilePath, comboRawRows);
         rawFiles.push(rawFilePath);
-        allRawRows.push(...rawRows);
 
-        if (rawRows.length > 0 && typeof config.onRowsScraped === "function") {
-          const pageCanonical = buildCanonicalRows(rawRows);
-          if (pageCanonical.length > 0) {
-            config.onRowsScraped(pageCanonical);
-          }
+        const comboCanonical = buildCanonicalRows(comboRawRows);
+        allCanonicalRows.push(...comboCanonical);
+
+        if (comboCanonical.length > 0 && typeof config.onRowsScraped === "function") {
+          config.onRowsScraped(comboCanonical);
         }
 
-        progress.completedUrls[url] = { completedAt: new Date().toISOString(), rowCount: rawRows.length };
+        progress.completedUrls[combo.comboKey] = {
+          completedAt: new Date().toISOString(),
+          rowCount: comboRawRows.length,
+          canonicalCount: comboCanonical.length,
+          completed: true,
+        };
         saveApolloProgress(config.rawOutputDir, progress);
 
-        // Random human-like break
-        urlsSinceBreak++;
-        if (urlsSinceBreak >= nextBreakAt) {
+        console.log(`  Combo complete: ${comboRawRows.length} raw, ${comboCanonical.length} canonical`);
+
+        if (comboCanonical.length > 0) {
+          successCount++;
+          if (successCount % SESSION_ROTATION_INTERVAL === 0) {
+            console.log(`\n  Session rotation after ${successCount} successful combos. Refreshing browser...`);
+            await context.close();
+            ({ context, page } = await openApolloPage(config, APOLLO_BOOTSTRAP_URL));
+          }
+        }
+
+        combosSinceBreak++;
+        if (combosSinceBreak >= nextBreakAt) {
           const breakMs = randomIntBetween(120000, 300000);
           console.log(`\n  Human-like break: pausing ${(breakMs / 60000).toFixed(1)} min...`);
           await new Promise((r) => setTimeout(r, breakMs));
-          urlsSinceBreak = 0;
+          combosSinceBreak = 0;
           nextBreakAt = randomIntBetween(BREAK_INTERVAL_MIN, BREAK_INTERVAL_MAX);
         }
       }
@@ -1629,10 +1716,15 @@ async function runApolloScrape(config) {
     }
   }
 
-  const canonicalRows = buildCanonicalRows(allRawRows);
+  // Dedupe all canonical rows
+  const deduped = new Map();
+  for (const row of allCanonicalRows) {
+    const url = normalizeLinkedInUrl(row.linkedinUrl || "");
+    if (url && !deduped.has(url)) deduped.set(url, row);
+  }
+  const canonicalRows = [...deduped.values()];
   writeCanonicalRows(config.canonicalOutputCsv, canonicalRows);
 
-  // All URLs completed — clear progress so next fresh run starts clean
   clearApolloProgress(config.rawOutputDir);
 
   console.log(`\nApollo raw output dir: ${config.rawOutputDir}`);
@@ -1650,9 +1742,9 @@ async function runApolloScrape(config) {
     rawFiles,
     canonicalOutputCsv: config.canonicalOutputCsv,
     canonicalRows,
-    rawRowCount: allRawRows.length,
+    rawRowCount: allCanonicalRows.length,
     canonicalRowCount: canonicalRows.length,
-    urlCount: batch.length,
+    urlCount: combos.length,
   };
 }
 
@@ -1665,6 +1757,8 @@ module.exports = {
   buildRawFileName,
   clearApolloProgress,
   extractApolloUrlKey,
+  extractSearchFiltersFromTemplateUrl,
+  fetchApolloPeopleSearch,
   loadApolloProgress,
   normalizeApolloCompanyName,
   normalizeApolloFirmCacheKey,
