@@ -92,6 +92,11 @@ const CONFIG = {
   // Max profiles to process per run
   maxProfiles: parseInt(process.env.MAX_PROFILES || "9999", 10),
 
+  // Watch mode: poll DB for new rows after queue is empty
+  kasprWatch: parseBooleanEnv(process.env.KASPR_WATCH, true),
+  kasprPollIntervalMs: parseInt(process.env.KASPR_POLL_INTERVAL_MS || "30000", 10),
+  kasprMaxIdlePolls: parseInt(process.env.KASPR_MAX_IDLE_POLLS || "10", 10),
+
   // How long to wait for Kaspr widget to appear and finish loading (ms)
   kaspWidgetTimeout: 60_000,
 
@@ -1037,14 +1042,14 @@ async function main() {
     }
 
     trackingMap = trackingDb.loadAllRows(db);
-    const urlsToProcess = buildKasprQueueRows(trackingMap, excludedCompanies);
+    let urlsToProcess = buildKasprQueueRows(trackingMap, excludedCompanies);
     const trackedCount = Object.keys(trackingMap).length;
     const completedCount = trackedCount - urlsToProcess.length;
     console.log(
       `${urlsToProcess.length} pending LinkedIn profile(s) queued in master tracking (${completedCount} already completed, ${trackedCount} total tracked).`
     );
 
-    if (urlsToProcess.length === 0) {
+    if (urlsToProcess.length === 0 && !CONFIG.kasprWatch) {
       if (trackedCount === 0) {
         console.error(
           "No LinkedIn profiles are available to process. Add rows via Apollo/manual input first so they land in master tracking."
@@ -1062,11 +1067,6 @@ async function main() {
       return;
     }
 
-    const batch = urlsToProcess.slice(0, CONFIG.maxProfiles);
-    console.log(
-      `Processing ${batch.length} queued profile(s) from master tracking in this run (max: ${CONFIG.maxProfiles})\n`
-    );
-
     if (!CONFIG.extensionPath) {
       console.error("ERROR: Could not find a usable Kaspr extension path.");
       console.error("Set KASPR_EXTENSION_PATH or restore one of these candidate locations:");
@@ -1079,6 +1079,9 @@ async function main() {
     console.log(`Using Kaspr extension: ${CONFIG.extensionPath}`);
     if (CONFIG.extensionSource) {
       console.log(`Extension source: ${CONFIG.extensionSource}`);
+    }
+    if (CONFIG.kasprWatch) {
+      console.log(`Watch mode: polling every ${(CONFIG.kasprPollIntervalMs / 1000).toFixed(0)}s, exits after ${CONFIG.kasprMaxIdlePolls} idle polls.`);
     }
 
     const browser = await puppeteer.launch({
@@ -1102,82 +1105,101 @@ async function main() {
 
     console.log("Browser ready with request interception.\n");
 
-    let processed = 0;
-    for (const row of batch) {
-      processed++;
-      const url = row[CONFIG.urlColumn];
-      const profileId = url.match(/linkedin\.com\/in\/([^/?#]+)/)?.[1];
-      if (!profileId) {
-        console.log(`[${processed}/${batch.length}] Invalid URL: ${url}`);
+    let totalProcessed = 0;
+    let idlePolls = 0;
+
+    while (true) {
+      trackingMap = trackingDb.loadAllRows(db);
+      urlsToProcess = buildKasprQueueRows(trackingMap, excludedCompanies);
+
+      if (urlsToProcess.length === 0) {
+        if (!CONFIG.kasprWatch || idlePolls >= CONFIG.kasprMaxIdlePolls) break;
+        idlePolls++;
+        console.log(
+          `\nNo pending profiles. Watching for new rows... (poll ${idlePolls}/${CONFIG.kasprMaxIdlePolls}, next check in ${(CONFIG.kasprPollIntervalMs / 1000).toFixed(0)}s)`
+        );
+        await sleep(CONFIG.kasprPollIntervalMs);
         continue;
       }
 
-      const displayName = row.Name || profileId;
-      console.log(`\n[${processed}/${batch.length}] ${displayName} (${row.Company || ""})`);
+      idlePolls = 0;
+      const batch = urlsToProcess.slice(0, CONFIG.maxProfiles);
+      console.log(
+        `\nProcessing ${batch.length} queued profile(s) from master tracking (${totalProcessed} done so far)\n`
+      );
 
-      let attempt = 0;
-      while (attempt < 2) {
-        try {
-          await page.goto(`https://www.linkedin.com/in/${profileId}/`, {
-            waitUntil: "domcontentloaded",
-            timeout: CONFIG.pageNavigationTimeout,
-          });
-          await sleep(CONFIG.profileSettleDelay);
-
-          const { emails, phones } = await extractKasprData(page);
-
-          console.log(
-            `  ${displayName} → ${emails.length > 0 ? emails.join(", ") : "no email"}`
-          );
-
-          const bestEmail = pickBestEmail(emails, row.Company);
-          const merged = trackingDb.upsertRow(db, {
-            linkedinUrl: url,
-            Name: row.Name,
-            Title: row.Title,
-            Company: row.Company,
-            email: bestEmail,
-            all_emails: emails.join("; "),
-            phones: phones.join("; "),
-            kaspr_status: emails.length > 0 ? "found" : "no_email",
-            kaspr_scraped_at: new Date().toISOString(),
-            source_stage: "kaspr",
-          });
-          trackingMap[url] = merged;
-          break;
-        } catch (err) {
-          const retryable = /Navigation timeout|ERR_ABORTED/.test(err.message || "");
-          const shouldRetry = retryable && attempt === 0;
-
-          if (shouldRetry) {
-            console.log(`  Navigation failed (${err.message}). Resetting page and retrying once...`);
-            page = await resetPage(browser, page);
-            attempt++;
-            continue;
-          }
-
-          console.error(`  Error: ${err.message}`);
-          const merged = trackingDb.upsertRow(db, {
-            linkedinUrl: url,
-            Name: row.Name,
-            Title: row.Title,
-            Company: row.Company,
-            kaspr_status: "error",
-            kaspr_scraped_at: new Date().toISOString(),
-            source_stage: "kaspr",
-          });
-          trackingMap[url] = merged;
-          break;
+      for (const row of batch) {
+        totalProcessed++;
+        const url = row[CONFIG.urlColumn];
+        const profileId = url.match(/linkedin\.com\/in\/([^/?#]+)/)?.[1];
+        if (!profileId) {
+          console.log(`[${totalProcessed}] Invalid URL: ${url}`);
+          continue;
         }
-      }
 
-      if (processed < batch.length) {
+        const displayName = row.Name || profileId;
+        console.log(`[${totalProcessed}] ${displayName} (${row.Company || ""})`);
+
+        let attempt = 0;
+        while (attempt < 2) {
+          try {
+            await page.goto(`https://www.linkedin.com/in/${profileId}/`, {
+              waitUntil: "domcontentloaded",
+              timeout: CONFIG.pageNavigationTimeout,
+            });
+            await sleep(CONFIG.profileSettleDelay);
+
+            const { emails, phones } = await extractKasprData(page);
+
+            console.log(
+              `  ${displayName} → ${emails.length > 0 ? emails.join(", ") : "no email"}`
+            );
+
+            const bestEmail = pickBestEmail(emails, row.Company);
+            trackingDb.upsertRow(db, {
+              linkedinUrl: url,
+              Name: row.Name,
+              Title: row.Title,
+              Company: row.Company,
+              email: bestEmail,
+              all_emails: emails.join("; "),
+              phones: phones.join("; "),
+              kaspr_status: emails.length > 0 ? "found" : "no_email",
+              kaspr_scraped_at: new Date().toISOString(),
+              source_stage: "kaspr",
+            });
+            break;
+          } catch (err) {
+            const retryable = /Navigation timeout|ERR_ABORTED/.test(err.message || "");
+            const shouldRetry = retryable && attempt === 0;
+
+            if (shouldRetry) {
+              console.log(`  Navigation failed (${err.message}). Resetting page and retrying once...`);
+              page = await resetPage(browser, page);
+              attempt++;
+              continue;
+            }
+
+            console.error(`  Error: ${err.message}`);
+            trackingDb.upsertRow(db, {
+              linkedinUrl: url,
+              Name: row.Name,
+              Title: row.Title,
+              Company: row.Company,
+              kaspr_status: "error",
+              kaspr_scraped_at: new Date().toISOString(),
+              source_stage: "kaspr",
+            });
+            break;
+          }
+        }
+
         await randomDelay();
       }
     }
 
     console.log(`\nDone! Master tracking: ${CONFIG.autoEmailTrackingDb}`);
-    console.log(`Processed: ${processed}, Total tracked profiles: ${trackingDb.countRows(db)}`);
+    console.log(`Processed: ${totalProcessed}, Total tracked profiles: ${trackingDb.countRows(db)}`);
     exportTrackingArtifacts(db, { scrapeOutputCsv });
 
     await browser.close();
