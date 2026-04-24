@@ -639,6 +639,16 @@ function scoreApolloOrganizationCandidate(firmName, candidateName) {
     firmNormalized.length >= 3 &&
     (candidateNormalized.includes(firmNormalized) || firmNormalized.includes(candidateNormalized))
   ) {
+    // Guard: candidate must START with the firm name (not contain it in the middle)
+    // "West Valley National Bank" should NOT match "Valley National"
+    if (!candidateNormalized.startsWith(firmNormalized) && !firmNormalized.startsWith(candidateNormalized)) {
+      return { score: 0, reason: "no_exactish_name_match" };
+    }
+    // Guard: reject if candidate is much longer (likely a division/program, not the company)
+    // "M&T Bank Center for Innovation" has 4 extra tokens beyond "m t bank"
+    if (candidateTokens.length > firmTokens.length + 3) {
+      return { score: 0, reason: "no_exactish_name_match" };
+    }
     return {
       score: 50,
       reason: "substring_name_match",
