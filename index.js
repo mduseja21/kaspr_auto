@@ -63,8 +63,8 @@ function normalizePipelineMode(value) {
 
 // ─── CONFIG ───────────────────────────────────────────────────────────
 const CONFIG = {
-  kasprEmail: process.env.KASPR_EMAIL || "ajakki@purdue.edu",
-  kasprPassword: process.env.KASPR_PASSWORD || "Ashwin@387",
+  kasprEmail: process.env.KASPR_EMAIL || "",
+  kasprPassword: process.env.KASPR_PASSWORD || "",
 
   extensionPath: RESOLVED_EXTENSION.path,
   extensionSource: RESOLVED_EXTENSION.source,
