@@ -560,6 +560,18 @@ function normalizeApolloCompanyName(value) {
   return tokenizeApolloCompanyName(value).join(" ");
 }
 
+const FINANCIAL_KEYWORDS = new Set([
+  "capital", "management", "partners", "trading", "investments",
+  "securities", "asset", "fund", "advisors", "group", "holdings",
+  "financial", "bank", "insurance", "hedge", "ventures", "equity",
+  "credit", "advisory", "strategies", "systematic",
+]);
+
+function scoreFinancialRelevance(candidateName) {
+  const tokens = tokenizeApolloCompanyName(candidateName);
+  return tokens.filter((t) => FINANCIAL_KEYWORDS.has(t)).length;
+}
+
 function sharedTokenPrefixLength(leftTokens, rightTokens) {
   const limit = Math.min(leftTokens.length, rightTokens.length);
   let index = 0;
@@ -623,6 +635,16 @@ function scoreApolloOrganizationCandidate(firmName, candidateName) {
     };
   }
 
+  if (
+    firmNormalized.length >= 3 &&
+    (candidateNormalized.includes(firmNormalized) || firmNormalized.includes(candidateNormalized))
+  ) {
+    return {
+      score: 50,
+      reason: "substring_name_match",
+    };
+  }
+
   return {
     score: 0,
     reason: "no_exactish_name_match",
@@ -676,28 +698,29 @@ function selectApolloOrganizationMatch(firmName, candidates) {
     };
   }
 
-  const topCandidate = scoredCandidates[0];
-  if (
-    topCandidate.reason === "relaxed_prefix_name_match" &&
-    scoredCandidates.length > 1
-  ) {
-    const relaxedCandidates = scoredCandidates
-      .filter((candidate) => candidate.reason === "relaxed_prefix_name_match")
-      .slice(0, 3)
-      .map((candidate) => candidate.candidate.name)
-      .join(" | ");
-    return {
-      firmName,
-      status: "unresolved",
-      orgId: "",
-      matchedCompanyName: "",
-      matchReason: `ambiguous_relaxed_prefix_name_match: ${relaxedCandidates}`,
-    };
+  // For relaxed/substring matches, re-rank by financial relevance only if there's a clear winner
+  const hasRelaxedMatches = scoredCandidates.some((c) =>
+    ["relaxed_prefix_name_match", "substring_name_match"].includes(c.reason)
+  );
+  if (hasRelaxedMatches && scoredCandidates.length > 1) {
+    const finScores = scoredCandidates.map((c) => scoreFinancialRelevance(c.candidate.name));
+    const maxFin = Math.max(...finScores);
+    const hasFinancialCandidate = maxFin > 0;
+    if (hasFinancialCandidate) {
+      scoredCandidates.sort((a, b) => {
+        const finDiff = scoreFinancialRelevance(b.candidate.name) - scoreFinancialRelevance(a.candidate.name);
+        if (finDiff !== 0) return finDiff;
+        if (b.score !== a.score) return b.score - a.score;
+        return a.candidate.name.length - b.candidate.name.length;
+      });
+    }
   }
 
+  const topCandidate = scoredCandidates[0];
   const tiedCandidates = scoredCandidates.filter((candidate) => candidate.score === topCandidate.score);
 
   if (tiedCandidates.length > 1) {
+    // Check if all tied candidates normalize to the same name
     const uniqueNormalizedNames = new Set(
       tiedCandidates.map((c) => normalizeApolloCompanyName(c.candidate.name))
     );
@@ -708,6 +731,41 @@ function selectApolloOrganizationMatch(firmName, candidates) {
         orgId: topCandidate.candidate.orgId,
         matchedCompanyName: topCandidate.candidate.name,
         matchReason: `${topCandidate.reason}_deduped_variants`,
+      };
+    }
+
+    // Financial keyword tiebreaker — prefer candidates with financial terms
+    const withFinanceScore = tiedCandidates
+      .map((c) => ({ ...c, financeScore: scoreFinancialRelevance(c.candidate.name) }))
+      .sort((a, b) => {
+        if (b.financeScore !== a.financeScore) return b.financeScore - a.financeScore;
+        return a.candidate.name.length - b.candidate.name.length;
+      });
+
+    const topFinance = withFinanceScore[0].financeScore;
+    const hasAnyFinancial = topFinance > 0;
+    const financeTied = withFinanceScore.filter((c) => c.financeScore === topFinance).length;
+
+    if (hasAnyFinancial && financeTied === 1) {
+      return {
+        firmName,
+        status: "resolved",
+        orgId: withFinanceScore[0].candidate.orgId,
+        matchedCompanyName: withFinanceScore[0].candidate.name,
+        matchReason: `${topCandidate.reason}_financial_keyword_tiebreak`,
+      };
+    }
+
+    // Multiple financial candidates with same score — pick shortest name (parent entity)
+    if (hasAnyFinancial && financeTied > 1) {
+      const financialOnly = withFinanceScore.filter((c) => c.financeScore === topFinance);
+      financialOnly.sort((a, b) => a.candidate.name.length - b.candidate.name.length);
+      return {
+        firmName,
+        status: "resolved",
+        orgId: financialOnly[0].candidate.orgId,
+        matchedCompanyName: financialOnly[0].candidate.name,
+        matchReason: `${topCandidate.reason}_financial_shortest_name`,
       };
     }
 
@@ -1249,8 +1307,29 @@ async function prepareApolloFirmInput(config) {
       }
 
       try {
-        const payload = await fetchApolloCompanySearchPayload(lookupPage, firmEntry.firmName);
-        const candidates = extractApolloCompanyCandidates(payload);
+        let payload = await fetchApolloCompanySearchPayload(lookupPage, firmEntry.firmName);
+        let candidates = extractApolloCompanyCandidates(payload);
+
+        // Fallback: try shorter search queries if no candidates found
+        if (candidates.length === 0) {
+          const tokens = tokenizeApolloCompanyName(firmEntry.firmName);
+          const fallbacks = [];
+          if (tokens.length > 2) fallbacks.push(tokens.slice(0, 2).join(" "));
+          if (tokens.length > 1) fallbacks.push(tokens[0]);
+
+          for (const fallbackQuery of fallbacks) {
+            await waitRandomActionDelay(lookupPage, config, "between fallback company lookups");
+            try {
+              payload = await fetchApolloCompanySearchPayload(lookupPage, fallbackQuery);
+              candidates = extractApolloCompanyCandidates(payload);
+              if (candidates.length > 0) {
+                console.log(`  Fallback search "${fallbackQuery}" found ${candidates.length} candidate(s).`);
+                break;
+              }
+            } catch {}
+          }
+        }
+
         const result = upsertApolloOrgMatchCache(
           orgMatchCache,
           selectApolloOrganizationMatch(firmEntry.firmName, candidates)
