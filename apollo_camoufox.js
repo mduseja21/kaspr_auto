@@ -655,6 +655,24 @@ function scoreApolloOrganizationCandidate(firmName, candidateName) {
     };
   }
 
+  // First-word matching: if "Alyeska Group" doesn't match "Alyeska Investment Management",
+  // check if the first distinctive word matches the start of the candidate
+  if (firmTokens.length >= 1 && candidateTokens.length >= 1 && firmTokens[0].length >= 3) {
+    if (candidateTokens[0] === firmTokens[0] && candidateTokens.length <= firmTokens.length + 3) {
+      const candidateHasFinancial = candidateTokens.some((t) => FINANCIAL_KEYWORDS.has(t));
+      if (candidateHasFinancial) {
+        return {
+          score: 40,
+          reason: "first_word_financial_match",
+        };
+      }
+      return {
+        score: 30,
+        reason: "first_word_match",
+      };
+    }
+  }
+
   return {
     score: 0,
     reason: "no_exactish_name_match",
