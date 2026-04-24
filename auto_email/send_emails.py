@@ -502,6 +502,9 @@ def main():
                 body = render(body_tpl, contact)
 
                 try:
+                    if auth_method == "oauth2":
+                        sender_state["token"] = get_oauth2_token(provider["address"])
+
                     if auth_method == "gmail_api":
                         send_email_gmail_api(sender_state["gmail_service"], provider["address"], email_addr, subj, body, args.attach)
                     elif auth_method == "oauth2":
